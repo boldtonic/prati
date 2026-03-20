@@ -1,0 +1,696 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Prati</title>
+<style>
+:root {
+  --bg:  #08080a; --s0: #0d1117; --s1: #111827; --s2: #161d2b;
+  --bd:  #1e2d45; --b2: #0e1623;
+  --t1:  #e2e8f0; --t2: #64748b; --t3: #334155;
+  --green:  #22c55e; --red: #ef4444; --amber: #f59e0b;
+  --blue:   #38bdf8; --purple: #818cf8;
+  --mono: 'SF Mono', 'Cascadia Code', ui-monospace, monospace;
+}
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; overflow: hidden; }
+body {
+  background: var(--bg); color: var(--t1);
+  font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', system-ui, sans-serif;
+  font-size: 13px; display: flex; flex-direction: column;
+}
+
+/* ── Header ── */
+#hdr {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 0 20px; height: 42px; flex-shrink: 0;
+  background: var(--s1); border-bottom: 1px solid var(--bd);
+}
+.brand { font-size: 14px; font-weight: 600; color: var(--purple); letter-spacing: -.02em; }
+.brand-ver { font-size: 9px; color: var(--t3); margin-left: 4px; }
+.hdr-r { display: flex; align-items: center; gap: 18px; }
+.hmeta { font-size: 11px; color: var(--t2); font-family: var(--mono); }
+.hmeta b { color: var(--t1); }
+.spill {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 2px 9px 2px 6px; border-radius: 20px;
+  font-size: 10px; font-weight: 500;
+  border: 1px solid var(--bd); background: var(--s0); color: var(--t2);
+}
+.spill.live { border-color: rgba(34,197,94,.35); color: var(--green); }
+.spill.scan { border-color: rgba(245,158,11,.35); color: var(--amber); }
+.spill.dead { border-color: rgba(239,68,68,.3);  color: var(--red); }
+.sdot { width: 5px; height: 5px; border-radius: 50%; background: currentColor; flex-shrink: 0; }
+.live .sdot { animation: pulse 2.5s ease-in-out infinite; }
+.scan .sdot { animation: pulse  .7s ease-in-out infinite; }
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.2} }
+
+/* ── Pinned strip ── */
+#pins-wrap { flex-shrink: 0; border-bottom: 1px solid var(--bd); }
+#pins-hdr { padding: 6px 20px 4px; display: flex; align-items: center; gap: 10px; }
+.sec-label { font-size: 10px; font-weight: 500; letter-spacing: .07em; text-transform: uppercase; color: var(--t3); }
+#pins-list { display: flex; gap: 8px; overflow-x: auto; padding: 0 20px 10px; scrollbar-width: none; }
+#pins-list::-webkit-scrollbar { display: none; }
+#no-pins-msg { font-size: 11px; color: var(--t3); font-family: var(--mono); padding: 6px 20px 10px; }
+
+.pc {
+  flex-shrink: 0; width: 210px;
+  background: var(--s1); border: 1px solid var(--bd); border-radius: 4px;
+  cursor: pointer; transition: border-color .2s;
+}
+.pc:hover { border-color: var(--blue); }
+.pc.active { border-color: rgba(129,140,248,.5); }
+.pc-top { display: flex; align-items: center; justify-content: space-between; padding: 8px 10px 4px; }
+.pc-sym { font-size: 13px; font-weight: 600; font-family: var(--mono); color: var(--t1); }
+.pc-score { font-size: 11px; font-family: var(--mono); font-weight: 600; color: var(--purple); }
+.pc-unpin { background: none; border: none; cursor: pointer; color: var(--t3); font-size: 15px; line-height: 1; padding: 0 2px; }
+.pc-unpin:hover { color: var(--red); }
+.pc-bars { padding: 2px 10px 2px; height: 34px; display: flex; align-items: center; }
+.pc-meta { padding: 0 10px 4px; display: flex; gap: 10px; font-size: 10px; font-family: var(--mono); color: var(--t2); }
+.pc-note { padding: 5px 10px 8px; font-size: 11px; line-height: 1.55; color: var(--t2); border-top: 1px solid var(--bd); min-height: 40px; }
+.pc-note.ready { color: var(--t1); }
+.pc-note.waiting { color: var(--t3); font-style: italic; }
+
+/* ── Bottom layout ── */
+#bottom { display: flex; flex: 1; overflow: hidden; }
+
+/* ── Chat ── */
+#chat-wrap {
+  flex: 1; min-width: 0; display: flex; flex-direction: column;
+  border-right: 1px solid var(--bd);
+}
+#chat-hdr { padding: 7px 16px 6px; border-bottom: 1px solid var(--bd); flex-shrink: 0; }
+#chat-msgs {
+  flex: 1; overflow-y: auto; padding: 14px 18px; display: flex;
+  flex-direction: column; gap: 18px;
+  scrollbar-width: thin; scrollbar-color: var(--bd) transparent;
+}
+
+/* ── Message blocks ── */
+.msg { display: flex; flex-direction: column; gap: 5px; }
+.msg-who { font-size: 10px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; font-family: var(--mono); }
+.msg-who.prati { color: var(--purple); }
+.msg-who.you   { color: var(--blue); }
+
+/* Assistant messages: subtle left border, slightly inset */
+.msg.msg-prati {
+  padding-left: 12px;
+  border-left: 2px solid var(--purple);
+}
+
+/* User messages: right-aligned visual distinction */
+.msg.msg-you {
+  align-items: flex-end;
+}
+.msg.msg-you .msg-body {
+  background: var(--s2);
+  border: 1px solid var(--bd);
+  border-radius: 4px;
+  padding: 7px 11px;
+  max-width: 90%;
+  text-align: left;
+}
+
+.msg-body {
+  font-size: 13px; line-height: 1.7; color: var(--t1);
+}
+.msg-body.dim { color: var(--t3); font-style: italic; }
+
+/* ── Markdown rendered elements ── */
+.msg-body .md-h2 {
+  font-size: 13px; font-weight: 700; color: var(--t1);
+  margin: 10px 0 5px; letter-spacing: .01em;
+}
+.msg-body .md-h2:first-child { margin-top: 0; }
+.msg-body .md-hr {
+  border: none; border-top: 1px solid var(--bd);
+  margin: 10px 0;
+}
+.msg-body ul {
+  padding-left: 16px; margin: 4px 0; display: flex; flex-direction: column; gap: 3px;
+}
+.msg-body li {
+  line-height: 1.6; color: var(--t1);
+}
+.msg-body p {
+  margin: 0 0 8px;
+}
+.msg-body p:last-child { margin-bottom: 0; }
+.msg-body strong { color: var(--t1); font-weight: 600; }
+
+/* ── Chat footer ── */
+#chat-foot {
+  flex-shrink: 0; padding: 10px 12px;
+  border-top: 1px solid var(--bd); display: flex; gap: 8px; align-items: flex-end;
+}
+#chat-in {
+  flex: 1; background: var(--s0); border: 1px solid var(--bd); border-radius: 3px;
+  padding: 7px 10px; color: var(--t1); font-family: inherit; font-size: 12px;
+  outline: none; resize: none;
+  min-height: 54px; max-height: 120px;
+  line-height: 1.5; overflow-y: auto;
+}
+#chat-in:focus { border-color: var(--blue); }
+#chat-send {
+  padding: 0 14px; height: 36px; flex-shrink: 0;
+  background: var(--s1); border: 1px solid var(--bd); border-radius: 3px;
+  color: var(--blue); font-size: 12px; font-weight: 500; cursor: pointer;
+}
+#chat-send:hover:not(:disabled) { border-color: var(--blue); }
+#chat-send:disabled { opacity: .35; cursor: default; }
+
+/* ── Radar table ── */
+#table-wrap { flex: 1; overflow: auto; scrollbar-width: thin; scrollbar-color: var(--bd) transparent; }
+#radar { width: 100%; border-collapse: collapse; table-layout: fixed; }
+#radar thead th {
+  position: sticky; top: 0; z-index: 2; background: var(--s1);
+  padding: 7px 10px; font-size: 10px; font-weight: 500; text-transform: uppercase;
+  letter-spacing: .07em; color: var(--t2); text-align: right;
+  border-bottom: 1px solid var(--bd); white-space: nowrap; user-select: none;
+}
+#radar thead th.L { text-align: left; }
+#radar tbody td {
+  padding: 0 10px; height: 34px; font-family: var(--mono); font-variant-numeric: tabular-nums;
+  font-size: 12px; text-align: right; border-bottom: 1px solid var(--b2);
+  white-space: nowrap; overflow: hidden; vertical-align: middle;
+}
+#radar tbody td.L { text-align: left; }
+tr.dr { cursor: pointer; }
+tr.dr:hover td { background: var(--s2); }
+tr.dr.pinned td { background: rgba(129,140,248,.04); }
+tr.dr.pinned td:first-child { border-left: 2px solid rgba(129,140,248,.5); }
+tr.dr.triple td { background: rgba(245,158,11,.04); }
+tr.dr.triple td:first-child { border-left: 2px solid var(--amber); }
+.sb {
+  display: inline-flex; align-items: center; justify-content: center;
+  min-width: 44px; padding: 2px 6px; border-radius: 3px;
+  font-size: 12px; font-weight: 700; border: 1px solid transparent;
+  font-variant-numeric: tabular-nums;
+}
+.sb-x  { background: rgba(129,140,248,.18); border-color: rgba(129,140,248,.45); color: #a5b4fc; }
+.sb-hi { background: rgba(129,140,248,.09); border-color: rgba(129,140,248,.25); color: #818cf8; }
+.sb-md { background: rgba(245,158,11,.08);  border-color: rgba(245,158,11,.22);  color: #f59e0b; }
+.sb-lo { color: var(--t3); border-color: var(--b2); }
+.pin-btn {
+  padding: 2px 8px; border-radius: 3px; font-size: 10px; cursor: pointer;
+  border: 1px solid var(--bd); background: transparent; color: var(--t3);
+  transition: border-color .15s, color .15s;
+}
+.pin-btn:hover  { border-color: var(--purple); color: var(--purple); }
+.pin-btn.pinned { border-color: rgba(129,140,248,.4); color: var(--purple); background: rgba(129,140,248,.1); }
+.empty-td { text-align: center !important; padding: 60px 0 !important; color: var(--t2); }
+.vol-sel {
+  background: transparent; border: none; color: var(--t2);
+  font-size: 10px; font-weight: 500; text-transform: uppercase;
+  letter-spacing: .07em; cursor: pointer; outline: none;
+}
+.vol-sel option { background: var(--s1); color: var(--t1); }
+</style>
+</head>
+<body>
+
+<div id="hdr">
+  <div style="display:flex;align-items:center;gap:12px">
+    <span class="brand">&#x092A;&#x094D;&#x0930;&#x0924;&#x093F; Prati<span class="brand-ver">v0.2</span></span>
+    <div class="spill" id="spill"><span class="sdot"></span><span id="spill-lbl">Connecting…</span></div>
+  </div>
+  <div class="hdr-r">
+    <span class="hmeta" id="h-info"></span>
+    <span class="hmeta" id="h-age" style="color:var(--t3)"></span>
+  </div>
+</div>
+
+<div id="pins-wrap">
+  <div id="pins-hdr"><span class="sec-label">Pinned</span></div>
+  <div id="pins-list"></div>
+  <div id="no-pins-msg">No pinned tickers — click + in the table to pin.</div>
+</div>
+
+<div id="bottom">
+  <div id="chat-wrap">
+    <div id="chat-hdr"><span class="sec-label">Ask Prati</span></div>
+    <div id="chat-msgs">
+      <div class="msg msg-prati">
+        <span class="msg-who prati">Prati</span>
+        <span class="msg-body dim" id="welcome-msg">Connecting to scanner…</span>
+      </div>
+    </div>
+    <div id="chat-foot">
+      <textarea id="chat-in" placeholder="What's moving? Is EIGEN real?" rows="3"></textarea>
+      <button id="chat-send" disabled>Send</button>
+    </div>
+  </div>
+
+  <div id="table-wrap">
+    <table id="radar">
+      <colgroup>
+        <col style="width:34px">
+        <col style="width:95px">
+        <col style="width:76px">
+        <col style="width:44px">
+        <col style="width:84px">
+        <col style="width:64px">
+        <col style="width:56px">
+        <col style="width:46px">
+        <col>
+        <col style="width:50px">
+      </colgroup>
+      <thead>
+        <tr>
+          <th>#</th><th class="L">Ticker</th><th>Score</th><th>Age</th>
+          <th>
+            <select class="vol-sel" id="vol-sel">
+              <option value="5">Vol5m%</option>
+              <option value="10">Vol10m%</option>
+              <option value="15">Vol15m%</option>
+            </select>
+          </th>
+          <th>Conc%</th><th>BP%</th><th>Abn</th>
+          <th class="L">Volume</th><th>Pin</th>
+        </tr>
+      </thead>
+      <tbody id="tbody">
+        <tr><td colspan="10" class="empty-td">Waiting for first scan…</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+'use strict';
+
+var scan       = null;
+var pinned     = new Set();
+var pinNotes   = {};      // symbol → { text, updatedAt }
+var chatHist   = [];      // [{ role, content }]
+var chatBusy   = false;
+var volPeriod  = 5;
+var lastScanMs = null;
+
+// ── SSE ──────────────────────────────────────────────────────────────────────
+var es = new EventSource('/api/stream');
+es.onerror = function () { setStatus('dead'); };
+es.onmessage = function (e) {
+  var d = JSON.parse(e.data);
+  if      (d.type === 'scanning')       setStatus('scan');
+  else if (d.type === 'scan')           onScan(d);
+  else if (d.type === 'pins')           onPins(d.pins);
+  else if (d.type === 'pin_commentary') onPinNote(d);
+};
+
+function setStatus(s) {
+  var pill  = document.getElementById('spill');
+  var label = document.getElementById('spill-lbl');
+  pill.className = 'spill ' + (s === 'live' ? 'live' : s === 'scan' ? 'scan' : 'dead');
+  label.textContent = s === 'live' ? 'Live' : s === 'scan' ? 'Scanning…' : 'Disconnected';
+}
+
+// ── Scan ─────────────────────────────────────────────────────────────────────
+function onScan(d) {
+  scan       = d;
+  lastScanMs = Date.now();
+  setStatus('live');
+  var results = d.results || [];
+  document.getElementById('h-info').innerHTML =
+    '<b>' + d.eligibleCount + '</b> tickers &nbsp;·&nbsp; <b>' + d.duration + 's</b> scan';
+  renderTable(results);
+  renderPins();
+
+  // First scan — update welcome message
+  var wm = document.getElementById('welcome-msg');
+  if (wm) {
+    var top = results.length > 0
+      ? results[0].symbol.replace(/USDT$/, '') + ' leading at ' + results[0].score.toFixed(1)
+      : 'no breakouts this cycle';
+    wm.textContent = results.length + ' signals. ' + top + '. Ask me anything.';
+    wm.classList.remove('dim');
+    wm.removeAttribute('id');
+    document.getElementById('chat-send').disabled = false;
+  }
+}
+
+setInterval(function () {
+  if (!lastScanMs) return;
+  var s = Math.round((Date.now() - lastScanMs) / 1000);
+  document.getElementById('h-age').textContent = s + 's ago';
+}, 1000);
+
+// ── Pins ─────────────────────────────────────────────────────────────────────
+function onPins(pins) {
+  pinned = new Set(pins || []);
+  renderPins();
+  if (scan) renderTable(scan.results || []);
+}
+
+function onPinNote(d) {
+  pinNotes[d.symbol] = { text: d.text, updatedAt: d.updatedAt };
+  var el = document.getElementById('pcn-' + d.symbol);
+  if (el) { el.textContent = d.text; el.className = 'pc-note ready'; }
+}
+
+function pinTicker(sym) {
+  fetch('/api/pins/' + sym, { method: 'POST' }).catch(function () {});
+}
+function unpinTicker(sym) {
+  fetch('/api/pins/' + sym, { method: 'DELETE' }).catch(function () {});
+}
+
+// ── Pinned cards ─────────────────────────────────────────────────────────────
+function renderPins() {
+  var list = document.getElementById('pins-list');
+  var msg  = document.getElementById('no-pins-msg');
+
+  if (pinned.size === 0) {
+    list.innerHTML = '';
+    msg.style.display = '';
+    return;
+  }
+  msg.style.display = 'none';
+
+  // Remove cards for unpinned symbols
+  list.querySelectorAll('.pc').forEach(function (el) {
+    if (!pinned.has(el.dataset.sym)) el.remove();
+  });
+
+  // Update / add cards
+  pinned.forEach(function (sym) {
+    var existing = list.querySelector('[data-sym="' + sym + '"]');
+    var r        = scan && scan.results && scan.results.find(function (x) { return x.symbol === sym; });
+    if (existing) {
+      updateCard(existing, sym, r);
+    } else {
+      var card = makeCard(sym, r);
+      list.appendChild(card);
+    }
+  });
+}
+
+function makeCard(sym, result) {
+  var el = document.createElement('div');
+  el.className    = 'pc';
+  el.dataset.sym  = sym;
+  el.addEventListener('click', function (e) {
+    if (e.target.classList.contains('pc-unpin')) return;
+    askAbout(sym);
+  });
+  updateCard(el, sym, result);
+  return el;
+}
+
+function updateCard(el, sym, r) {
+  var short   = sym.replace(/USDT$/, '');
+  var score   = r ? r.score.toFixed(1) : '—';
+  var age     = r ? (r.age === 0 ? '<1m' : r.age + 'm') : '—';
+  var bp      = r ? r.bp + '%' : '—';
+  var conc    = r ? r.conc.toFixed(0) + '%' : '—';
+  var bpStyle = r && r.bp > 80 ? 'color:var(--green)' : r && r.bp < 30 ? 'color:var(--red)' : '';
+  var mini    = r && r.miniCandles && r.miniCandles.length ? miniSvg(r.miniCandles, r.baselineAvg, 140, 26) : '';
+  var note    = pinNotes[sym] ? pinNotes[sym].text : (r ? 'Agent watching…' : 'Not in current scan.');
+  var noteCls = pinNotes[sym] ? 'pc-note ready' : 'pc-note waiting';
+  el.className = 'pc' + (r ? ' active' : '');
+  el.innerHTML =
+    '<div class="pc-top">' +
+      '<span class="pc-sym">' + short + '</span>' +
+      '<span class="pc-score">' + score + '</span>' +
+      '<button class="pc-unpin" title="Unpin">&times;</button>' +
+    '</div>' +
+    '<div class="pc-bars">' + (mini || '<span style="font-size:10px;color:var(--t3)">awaiting scan</span>') + '</div>' +
+    '<div class="pc-meta">' +
+      '<span>' + age + '</span>' +
+      '<span style="' + bpStyle + '">BP ' + bp + '</span>' +
+      '<span>Conc ' + conc + '</span>' +
+    '</div>' +
+    '<div class="' + noteCls + '" id="pcn-' + sym + '">' + note + '</div>';
+
+  el.querySelector('.pc-unpin').addEventListener('click', function (e) {
+    e.stopPropagation();
+    unpinTicker(sym);
+  });
+}
+
+// ── Table ─────────────────────────────────────────────────────────────────────
+function renderTable(results) {
+  var tbody    = document.getElementById('tbody');
+  var filtered = results.filter(function (r) { return r.age < 30; });
+  if (filtered.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="10" class="empty-td">No breakouts detected this cycle</td></tr>';
+    return;
+  }
+  tbody.innerHTML = filtered.map(function (r, i) { return rowHtml(r, i); }).join('');
+
+  tbody.querySelectorAll('.pin-btn').forEach(function (btn) {
+    btn.addEventListener('click', function (e) {
+      e.stopPropagation();
+      var sym = btn.dataset.sym;
+      if (pinned.has(sym)) unpinTicker(sym); else pinTicker(sym);
+    });
+  });
+
+  tbody.querySelectorAll('tr.dr').forEach(function (tr) {
+    tr.addEventListener('click', function () { askAbout(tr.dataset.sym); });
+  });
+}
+
+function rowHtml(r, i) {
+  var triple   = r.score > 15 && r.conc > 40 && r.bp > 80;
+  var isPinned = pinned.has(r.symbol);
+  var cls      = 'dr' + (isPinned ? ' pinned' : '') + (triple ? ' triple' : '');
+
+  var ageText  = r.age === 0 ? '<1m' : r.age + 'm';
+  var ageStyle = r.age < 5 ? 'color:#f59e0b;font-weight:600' : r.age > 15 ? 'opacity:.35' : '';
+
+  var vol      = calcVol(r.miniCandles, volPeriod);
+  if (vol === null && volPeriod === 5) vol = r.vol5m;
+  var volStyle = vol === null ? 'color:var(--t3)' : vol >= 0 ? 'color:var(--green)' : 'color:var(--red)';
+  var volText  = vol === null ? '\u2014' : fmtPct(vol);
+
+  var concStyle = r.conc > 60 ? 'color:var(--red);font-weight:600' : r.conc > 40 ? 'color:var(--amber);font-weight:600' : 'color:var(--t3)';
+  var bpStyle   = r.bp > 80 ? 'color:var(--green);font-weight:600' : r.bp < 30 ? 'color:var(--red);font-weight:600' : 'color:var(--t3)';
+  var abnStyle  = r.consecutiveAbnormal >= 5 ? 'color:var(--red);font-weight:700' : r.consecutiveAbnormal >= 4 ? 'color:var(--amber)' : r.consecutiveAbnormal >= 3 ? 'color:#fde68a' : 'color:var(--t3)';
+
+  var short    = r.symbol.replace(/USDT$/, '');
+  var scoreC   = r.score > 25 ? 'sb sb-x' : r.score > 15 ? 'sb sb-hi' : r.score >= 5 ? 'sb sb-md' : 'sb sb-lo';
+  var mini     = r.miniCandles && r.miniCandles.length ? miniSvg(r.miniCandles, r.baselineAvg, 100, 26) : '';
+  var pinCls   = isPinned ? 'pin-btn pinned' : 'pin-btn';
+  var pinLbl   = isPinned ? '\u{1F4CC}' : '+';
+
+  return '<tr class="' + cls + '" data-sym="' + r.symbol + '">' +
+    '<td style="color:var(--t3);font-size:11px">' + (i + 1) + '</td>' +
+    '<td class="L"><a href="https://www.bitunix.com/es-es/contract-trade/' + r.symbol + '" ' +
+      'target="_blank" onclick="event.stopPropagation()" ' +
+      'style="color:var(--blue);text-decoration:none;font-weight:500">' + short + '</a></td>' +
+    '<td><span class="' + scoreC + '">' + r.score.toFixed(1) + '</span></td>' +
+    '<td style="' + ageStyle + '">' + ageText + '</td>' +
+    '<td style="' + volStyle + '">' + volText + '</td>' +
+    '<td style="' + concStyle + '">' + r.conc.toFixed(0) + '%</td>' +
+    '<td style="' + bpStyle + '">' + r.bp + '%</td>' +
+    '<td style="' + abnStyle + '">' + r.consecutiveAbnormal + '/5</td>' +
+    '<td class="L">' + mini + '</td>' +
+    '<td><button class="' + pinCls + '" data-sym="' + r.symbol + '">' + pinLbl + '</button></td>' +
+    '</tr>';
+}
+
+// ── Mini SVG bars ─────────────────────────────────────────────────────────────
+function miniSvg(candles, baselineAvg, totalW, h) {
+  var maxVol = 0;
+  for (var k = 0; k < candles.length; k++) if (candles[k].baseVol > maxVol) maxVol = candles[k].baseVol;
+  if (!maxVol) return '';
+  var bW = 3, bG = 1;
+  var svgW = candles.length * (bW + bG) - bG;
+  var baseH = Math.min(h - 1, Math.max(1, (baselineAvg / maxVol) * h));
+  var baseY = (h - baseH).toFixed(1);
+  var s = '<svg width="' + svgW + '" height="' + h + '" style="display:block;vertical-align:middle">';
+  s += '<line x1="0" y1="' + baseY + '" x2="' + svgW + '" y2="' + baseY + '" stroke="#1e3a5f" stroke-dasharray="2,3" stroke-width="1"/>';
+  for (var j = 0; j < candles.length; j++) {
+    var c   = candles[j];
+    var x   = j * (bW + bG);
+    var bH  = Math.max(2, (c.baseVol / maxVol) * h);
+    var y   = (h - bH).toFixed(1);
+    var col = c.close >= c.open ? '#22c55e' : '#ef4444';
+    var op  = j >= candles.length - 5 ? '1' : '0.22';
+    s += '<rect x="' + x + '" y="' + y + '" width="' + bW + '" height="' + bH.toFixed(1) + '" fill="' + col + '" opacity="' + op + '"/>';
+  }
+  s += '</svg>';
+  return s;
+}
+
+// ── Markdown renderer ─────────────────────────────────────────────────────────
+function renderMarkdown(text) {
+  // Split into lines for processing
+  var lines = text.split('\n');
+  var html = '';
+  var inList = false;
+
+  for (var i = 0; i < lines.length; i++) {
+    var line = lines[i];
+
+    // --- horizontal rule
+    if (/^---+$/.test(line.trim())) {
+      if (inList) { html += '</ul>'; inList = false; }
+      html += '<hr class="md-hr">';
+      continue;
+    }
+
+    // ## heading
+    var h2Match = line.match(/^##\s+(.+)$/);
+    if (h2Match) {
+      if (inList) { html += '</ul>'; inList = false; }
+      html += '<div class="md-h2">' + inlineMarkdown(h2Match[1]) + '</div>';
+      continue;
+    }
+
+    // - bullet list item
+    var liMatch = line.match(/^[-*]\s+(.+)$/);
+    if (liMatch) {
+      if (!inList) { html += '<ul>'; inList = true; }
+      html += '<li>' + inlineMarkdown(liMatch[1]) + '</li>';
+      continue;
+    }
+
+    // blank line
+    if (line.trim() === '') {
+      if (inList) { html += '</ul>'; inList = false; }
+      // paragraph break — only add spacing if there's content coming
+      html += '<p></p>';
+      continue;
+    }
+
+    // normal line — close list if open, wrap in paragraph
+    if (inList) { html += '</ul>'; inList = false; }
+    html += '<p>' + inlineMarkdown(line) + '</p>';
+  }
+
+  if (inList) html += '</ul>';
+
+  // Clean up consecutive empty paragraphs into a single break
+  html = html.replace(/(<p><\/p>){2,}/g, '<p></p>');
+  // Remove leading/trailing empty paragraphs
+  html = html.replace(/^(<p><\/p>)+/, '').replace(/(<p><\/p>)+$/, '');
+
+  return html;
+}
+
+function inlineMarkdown(text) {
+  // Escape HTML entities first (only for user-supplied content safety)
+  text = text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+  // **bold**
+  text = text.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+  // *italic*
+  text = text.replace(/\*(.+?)\*/g, '<em>$1</em>');
+  return text;
+}
+
+// ── Chat ─────────────────────────────────────────────────────────────────────
+function askAbout(sym) {
+  sendChat('What do you think about ' + sym.replace(/USDT$/, '') + ' right now?');
+}
+
+function sendChat(text) {
+  text = text.trim();
+  if (!text || chatBusy) return;
+  chatBusy = true;
+  document.getElementById('chat-send').disabled = true;
+  addMsg('you', text);
+  var replyEl = addMsg('prati', '\u2026', true);
+
+  // Build history (ensure starts with user role)
+  var hist = chatHist.slice(-8);
+  if (hist.length && hist[0].role !== 'user') hist = hist.slice(1);
+
+  fetch('/api/chat', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ message: text, history: hist }),
+  })
+  .then(function (r) { return r.json(); })
+  .then(function (d) {
+    if (d.error) {
+      replyEl.textContent = 'Error: ' + d.error;
+    } else {
+      replyEl.innerHTML = renderMarkdown(d.text);
+      if (!d.error) chatHist.push({ role: 'assistant', content: d.text });
+    }
+    replyEl.classList.remove('dim');
+  })
+  .catch(function () { replyEl.textContent = 'Request failed.'; })
+  .finally(function () {
+    chatBusy = false;
+    document.getElementById('chat-send').disabled = false;
+  });
+}
+
+function addMsg(who, text, loading) {
+  var msgs = document.getElementById('chat-msgs');
+  var div  = document.createElement('div');
+  div.className = 'msg msg-' + who;
+  var w = document.createElement('span');
+  w.className = 'msg-who ' + who;
+  w.textContent = who === 'prati' ? 'Prati' : 'You';
+  var b = document.createElement('div');
+  b.className = 'msg-body' + (loading ? ' dim' : '');
+  if (loading || who === 'you') {
+    b.textContent = text;
+  } else {
+    b.innerHTML = renderMarkdown(text);
+  }
+  div.appendChild(w); div.appendChild(b);
+  msgs.appendChild(div);
+  msgs.scrollTop = msgs.scrollHeight;
+  if (who === 'you') chatHist.push({ role: 'user', content: text });
+  return b;
+}
+
+// ── Chat input ────────────────────────────────────────────────────────────────
+var chatIn   = document.getElementById('chat-in');
+var chatSend = document.getElementById('chat-send');
+
+// Auto-grow textarea
+chatIn.addEventListener('input', function () {
+  this.style.height = 'auto';
+  this.style.height = Math.min(120, this.scrollHeight) + 'px';
+});
+
+chatSend.addEventListener('click', function () {
+  var v = chatIn.value;
+  chatIn.value = '';
+  chatIn.style.height = 'auto';
+  sendChat(v);
+});
+chatIn.addEventListener('keydown', function (e) {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    var v = chatIn.value;
+    chatIn.value = '';
+    chatIn.style.height = 'auto';
+    sendChat(v);
+  }
+});
+
+// ── Vol selector ──────────────────────────────────────────────────────────────
+var volSel = document.getElementById('vol-sel');
+volSel.addEventListener('change', function (e) {
+  e.stopPropagation();
+  volPeriod = parseInt(this.value, 10);
+  if (scan) renderTable(scan.results || []);
+});
+volSel.addEventListener('click', function (e) { e.stopPropagation(); });
+
+// ── Utils ─────────────────────────────────────────────────────────────────────
+function calcVol(candles, period) {
+  if (!candles || candles.length < period * 2) return null;
+  var last = 0, prior = 0, n = candles.length;
+  for (var i = n - period; i < n; i++) last  += candles[i].baseVol;
+  for (var i = n - period * 2; i < n - period; i++) prior += candles[i].baseVol;
+  return prior > 0 ? (last / prior - 1) * 100 : 0;
+}
+
+function fmtPct(v) {
+  var c = Math.min(9999, Math.max(-999, v));
+  return (c >= 0 ? '+' : '') + c.toFixed(0) + '%';
+}
+</script>
+</body>
+</html>

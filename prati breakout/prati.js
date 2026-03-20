@@ -13,6 +13,8 @@
  */
 
 const express = require('express');
+const path    = require('path');
+const fs      = require('fs');
 
 const BASE_URL          = 'https://fapi.bitunix.com';
 const KLINE_LIMIT       = 200;          // Bitunix 1m kline API caps at 200
@@ -25,6 +27,11 @@ const API_DELAY_MS      = 50;
 const BATCH_SIZE        = 5;
 const TOP_N             = 20;
 const PORT              = 3000;
+const MAX_BASELINE_AVG  = 10_000;   // filter always-active tickers (>$10K USDT avg/candle)
+const MAX_RECENT_SCANS  = 4;        // ring buffer depth for AI spotter
+const SPOTTER_CYCLE_FREQ = 4;       // fire spotter every N scans when signals exist
+const SPOTTER_MIN_SCORE = 5;        // minimum score to bother the API
+const ANTHROPIC_API_URL = 'https://api.anthropic.com/v1/messages';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -37,6 +44,29 @@ async function fetchJson(url) {
     const res = await fetch(url, { signal: controller.signal });
     clearTimeout(timeout);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res.json();
+  } catch (e) {
+    clearTimeout(timeout);
+    throw e;
+  }
+}
+
+async function postJson(url, body, headers = {}) {
+  const controller = new AbortController();
+  const timeout    = setTimeout(() => controller.abort(), 30_000);
+  try {
+    const res = await fetch(url, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json', ...headers },
+      body:    JSON.stringify(body),
+      signal:  controller.signal,
+    });
+    clearTimeout(timeout);
+    if (!res.ok) {
+      let msg = `HTTP ${res.status}`;
+      try { const b = await res.json(); msg = b?.error?.message || msg; } catch {}
+      throw new Error(msg);
+    }
     return res.json();
   } catch (e) {
     clearTimeout(timeout);
@@ -57,6 +87,47 @@ function formatVolPct(v) {
 function now() {
   return new Date().toISOString().replace('T', ' ').slice(0, 19) + ' UTC';
 }
+
+// ─── AI prompts ───────────────────────────────────────────────────────────────
+
+const CHAT_SYSTEM_PROMPT = `You are Prati, a live trading intelligence for a Bitunix futures scanner. You monitor 150+ mid/small-cap tickers for volume breakouts.
+
+Metric guide: score = avgRatio × consecutiveAbnormal (>15 strong, >25 exceptional). age = minutes since first detection (<5m fresh, >15m late). bp = buy pressure % (>80% bullish, <30% selling). conc = % of last hour's volume in last 5 minutes (baseline ~8%, >40% = concentrated now). vol5m/vol1h = % growth vs prior equivalent window. abn = candles above 3× baseline out of 5.
+
+Triple confirmation = score>15 AND conc>40 AND bp>80 simultaneously.
+
+When kline data is in the context, read the volume structure: escalating (staircase = sustained accumulation), spiking (single event, often shakeout), or distributed (sustained elevated = real move). Phase: ignition (1-2 abn candles, very early), acceleration (building, prime window), peak (massive single candle, often top), distribution (declining from peak, late).
+
+Pinned tickers are the user's active watches — treat them as high priority.
+
+Be direct. Use actual numbers. 3-5 sentences unless asked for deep analysis. Lead with the answer.`;
+
+const PIN_COMMENTARY_SYSTEM_PROMPT = `You are monitoring a pinned Bitunix futures ticker for a live trader. Given current metrics and trajectory, write exactly 1-2 sentences: what is happening RIGHT NOW and what to watch next. Use specific numbers. Examples: "Accelerating — score up 32→42→54 over 3 scans, BP 98%, still early." or "Fading — score dropped 54→23 last 2 scans, BP falling to 40%, likely peaked." No preamble, no hedging.`;
+
+const SPOTTER_SYSTEM_PROMPT = `You are a senior quant analyst embedded in Prati, a real-time volume breakout scanner for Bitunix crypto futures. You monitor mid/small-cap futures (500K–100M USDT daily volume) where sudden volume means accumulation or distribution.
+
+Data per ticker: Score (avgRatio × abnormalCount, >15 strong, >25 exceptional), Age (minutes since first detection, <5m fresh, >15m late), vol5m/vol1h (% volume growth vs prior equivalent window), conc (% of hour's volume in last 5min, baseline ~8%, >40% = happening now), bp (buy pressure from green candles, >80% buying, <30% selling), consecutiveAbnormal (candles above 3× baseline out of 5).
+
+Use previous scans to classify each ticker — NEW (not in prior scans = just started), ACCELERATING (score rising = strengthening), FADING (score falling = dying), PERSISTENT (all scans = check age).
+
+Output: 3–5 lines max. Lead with 1–2 actionable tickers or "Nothing actionable this cycle." For each: name, why it's interesting, early or late. Flag traps: high score + low bp = dumping; fading; stale age. Use ⚡ fresh, ⚠️ caution, ❌ avoid. No disclaimers, no hedging.`;
+
+const RESEARCH_SYSTEM_PROMPT = `You are a quant researcher analyzing a specific Bitunix futures ticker from the Prati volume scanner.
+
+You receive: current metrics, this ticker's trajectory across recent scan cycles, and the last 60 one-minute candles.
+
+Analyze:
+1. VOLUME STRUCTURE: Escalating (staircase), spiking (single candle), or distributed? Accelerating or decelerating in the most recent candles?
+2. TIMING: Ignition (1–3 abnormal candles, very early) / Acceleration (growing candle-over-candle, prime entry window) / Peak (massive candle, often the top) / Distribution (elevated but decreasing, late)?
+3. DIRECTION: Buy-side or sell-side dominant? Consistent or mixed? Mixed = battle, not clean breakout.
+4. CONVICTION 1–5: 5 = textbook escalating buy-side early breakout. 1 = avoid.
+
+Output format (exactly this):
+Volume Structure: [1–2 sentences]
+Timing: [phase] — [brief explanation]
+Direction: [Buy/Sell/Mixed] — [bp analysis]
+Conviction: [1–5] — [one-line justification]
+Bottom line: [one sentence — what should the trader do?]`;
 
 // ─── Data fetching ────────────────────────────────────────────────────────────
 
@@ -88,6 +159,7 @@ function calcBreakout(klines) {
   // ⚠ FIELD SWAP: on /kline endpoint, baseVol = USDT volume, quoteVol = token count
   const baselineAvg = baseline.reduce((s, c) => s + parseFloat(c.baseVol), 0) / baseline.length;
   if (baselineAvg === 0) return null;
+  if (baselineAvg > MAX_BASELINE_AVG) return null;  // skip always-active tickers
 
   const recentVols          = recent.map(c => parseFloat(c.baseVol));
   const recentAvg           = recentVols.reduce((a, b) => a + b, 0) / recentVols.length;
@@ -164,12 +236,31 @@ function printTable(results) {
 
 // ─── State ────────────────────────────────────────────────────────────────────
 
-const signalAges  = new Map();
-const klineCache  = new Map();   // symbol → sorted candle[]
-let latestResults = [];
-let latestMeta    = { scanTime: null, duration: null, eligibleCount: 0 };
-let sseClients    = [];
-let isScanning    = false;
+const signalAges      = new Map();
+const klineCache      = new Map();    // symbol → sorted candle[]
+const recentlyExpired = new Map();    // symbol → { symbol, expiredAt, peakScore, duration, finalBP, finalConc }
+const recentScans     = [];           // ring buffer of last MAX_RECENT_SCANS snapshots
+let latestResults     = [];
+let latestMeta        = { scanTime: null, duration: null, eligibleCount: 0 };
+let sseClients        = [];
+let isScanning        = false;
+let spottersActive    = false;
+let scanCycleCount    = 0;
+let lastAnalysis      = null;         // { text, generatedAt }
+let spotterCalling    = false;
+const devLog          = [];           // circular dev log, max 100 entries
+
+// ─── Pin state ────────────────────────────────────────────────────────────────
+const pinnedTickers      = new Set();   // server-side — survives page reload
+const pinCommentary      = new Map();   // symbol → { text, updatedAt }
+const pinLastCommentary  = new Map();   // symbol → timestamp of last API call
+
+function log(tag, msg) {
+  const entry = `[${now()}] [${tag}] ${msg}`;
+  console.log(entry);
+  devLog.push(entry);
+  if (devLog.length > 100) devLog.shift();
+}
 
 // ─── SSE ──────────────────────────────────────────────────────────────────────
 
@@ -197,7 +288,7 @@ async function scan() {
   try {
     tickers = await getEligibleTickers();
   } catch (e) {
-    console.error(`Ticker fetch failed: ${e.message}`);
+    log('ERROR', `ticker fetch failed: ${e.message}`);
     isScanning = false;
     return;
   }
@@ -236,7 +327,22 @@ async function scan() {
     r.age = Math.floor((nowMs - signalAges.get(r.symbol)) / 60_000);
   }
   for (const sym of signalAges.keys()) {
-    if (!activeSymbols.has(sym)) signalAges.delete(sym);
+    if (!activeSymbols.has(sym)) {
+      const lastKnown = latestResults.find(r => r.symbol === sym);
+      if (lastKnown) {
+        const duration = Math.floor((nowMs - signalAges.get(sym)) / 60_000);
+        recentlyExpired.set(sym, {
+          symbol: sym, expiredAt: nowMs, peakScore: lastKnown.score,
+          duration, finalBP: lastKnown.bp, finalConc: lastKnown.conc,
+        });
+        if (recentlyExpired.size > 5) {
+          const oldest = [...recentlyExpired.keys()].reduce((a, b) =>
+            recentlyExpired.get(a).expiredAt < recentlyExpired.get(b).expiredAt ? a : b);
+          recentlyExpired.delete(oldest);
+        }
+      }
+      signalAges.delete(sym);
+    }
   }
 
   // Attach last 30 candles per ticker for the mini bars
@@ -252,15 +358,132 @@ async function scan() {
       : [];
   }
 
+  // Ring buffer for AI spotter context
+  recentScans.unshift({
+    scanTime: now(),
+    results:  results.slice(0, 10).map(r => ({
+      symbol: r.symbol, score: r.score, age: r.age,
+      vol5m: r.vol5m, vol1h: r.vol1h, conc: r.conc, bp: r.bp,
+      consecutiveAbnormal: r.consecutiveAbnormal,
+    })),
+  });
+  if (recentScans.length > MAX_RECENT_SCANS) recentScans.pop();
+
+  // Trigger AI spotters (non-blocking)
+  scanCycleCount++;
+  if (spottersActive && !spotterCalling && process.env.ANTHROPIC_API_KEY) {
+    const triples   = results.filter(r => r.score > 15 && r.conc > 40 && r.bp > 80);
+    const hasSignal = results.some(r => r.score > SPOTTER_MIN_SCORE);
+    if (triples.length > 0 || (hasSignal && scanCycleCount % SPOTTER_CYCLE_FREQ === 0)) {
+      runSpotters(triples).catch(e => console.error('Spotter error:', e.message));
+    }
+  }
+
   const duration = ((Date.now() - t0) / 1000).toFixed(1);
-  console.log(`Duration: ${duration}s | Results: ${results.length} tickers with score > 0\n`);
+  log('SCAN', `done in ${duration}s — ${tickers.length} eligible, ${results.length} signals, cycle #${scanCycleCount + 1}`);
   printTable(results);
 
   latestResults = results;
   latestMeta    = { scanTime: now(), duration, eligibleCount: tickers.length };
   isScanning    = false;
 
-  pushSSE({ type: 'scan', ...latestMeta, results });
+  pushSSE({ type: 'scan', ...latestMeta, results, expired: [...recentlyExpired.values()] });
+
+  // Update commentary for pinned tickers (non-blocking)
+  for (const sym of pinnedTickers) {
+    const result  = results.find(r => r.symbol === sym);
+    const candles = klineCache.get(sym);
+    if (result && candles) {
+      updatePinCommentary(sym, result, candles).catch(e => log('PIN', `commentary error: ${e.message}`));
+    }
+  }
+}
+
+// ─── AI features ──────────────────────────────────────────────────────────────
+
+async function updatePinCommentary(symbol, result, candles) {
+  if (!process.env.ANTHROPIC_API_KEY) return;
+  const last = pinLastCommentary.get(symbol) || 0;
+  if (Date.now() - last < 2 * 60_000) return;   // max once per 2 min
+  pinLastCommentary.set(symbol, Date.now());
+
+  const trajectory = recentScans
+    .map(s => s.results.find(r => r.symbol === symbol))
+    .filter(Boolean)
+    .map(r => ({ score: +r.score.toFixed(1), bp: r.bp, conc: +r.conc.toFixed(0) }));
+
+  const payload = {
+    symbol: symbol.replace(/USDT$/, ''),
+    current: {
+      score: +result.score.toFixed(1), age: result.age,
+      bp: result.bp, conc: +result.conc.toFixed(0),
+      vol5m: +result.vol5m.toFixed(0), abn: result.consecutiveAbnormal,
+    },
+    trajectory,
+    candles: candles.slice(-30).map(c => ({
+      vol: parseFloat(c.baseVol), close: parseFloat(c.close), open: parseFloat(c.open),
+    })),
+  };
+
+  try {
+    const data = await postJson(ANTHROPIC_API_URL, {
+      model: 'claude-sonnet-4-6', max_tokens: 120,
+      system: PIN_COMMENTARY_SYSTEM_PROMPT,
+      messages: [{ role: 'user', content: JSON.stringify(payload) }],
+    }, { 'x-api-key': process.env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' });
+    const text = data.content[0].text;
+    pinCommentary.set(symbol, { text, updatedAt: now() });
+    pushSSE({ type: 'pin_commentary', symbol, text, updatedAt: now() });
+    log('PIN', `${symbol}: ${text.slice(0, 80)}`);
+  } catch (e) {
+    log('PIN', `API error for ${symbol}: ${e.message}`);
+  }
+}
+
+async function runSpotters(tripleResults) {
+  spotterCalling = true;
+  pushSSE({ type: 'spotter_calling' });
+  log('SPOTTER', `firing — ${tripleResults.length} triples: ${tripleResults.map(r => r.symbol).join(', ') || 'none (cycle trigger)'}`);
+
+  const prevSymbols = new Set(recentScans.slice(1).flatMap(s => s.results.map(r => r.symbol)));
+  const enriched    = (recentScans[0]?.results || []).map(r => ({
+    ...r,
+    isNew:      !prevSymbols.has(r.symbol),
+    trajectory: recentScans.slice(1)
+      .map(s => s.results.find(p => p.symbol === r.symbol))
+      .filter(Boolean)
+      .map(p => ({ score: p.score, conc: p.conc, bp: p.bp })),
+  }));
+
+  const payload = {
+    currentScan:         enriched,
+    tripleConfirmations: tripleResults.map(r => ({
+      symbol: r.symbol, score: r.score, bp: r.bp, conc: r.conc, age: r.age,
+    })),
+    scanTime: latestMeta.scanTime,
+  };
+
+  try {
+    const data = await postJson(ANTHROPIC_API_URL, {
+      model:      'claude-sonnet-4-6',
+      max_tokens: 300,
+      system:     SPOTTER_SYSTEM_PROMPT,
+      messages:   [{ role: 'user', content: JSON.stringify(payload) }],
+    }, {
+      'x-api-key':         process.env.ANTHROPIC_API_KEY,
+      'anthropic-version': '2023-06-01',
+    });
+    const text   = data.content[0].text;
+    lastAnalysis = { text, generatedAt: now() };
+    pushSSE({ type: 'analysis', text, generatedAt: lastAnalysis.generatedAt });
+    log('SPOTTER', `response: ${text.slice(0, 120).replace(/\n/g, ' ')}${text.length > 120 ? '…' : ''}`);
+  } catch (e) {
+    log('ERROR', `spotter API: ${e.message}`);
+    pushSSE({ type: 'analysis', text: `⚠️ Analysis failed: ${e.message}`, generatedAt: now() });
+  } finally {
+    spotterCalling = false;
+    pushSSE({ type: 'spotter_status', active: spottersActive, calling: false });
+  }
 }
 
 // ─── Dashboard HTML ───────────────────────────────────────────────────────────
@@ -272,140 +495,268 @@ function getDashboardHTML() {
   <meta charset="UTF-8">
   <title>Prati — Volume Breakout Scanner</title>
   <style>
+    :root {
+      --bg:      #080b12;
+      --surface: #0d1117;
+      --raised:  #111827;
+      --hover:   #161d2b;
+      --sel:     #0f1a2e;
+      --bs:      #1e2d45;
+      --b:       #131e2e;
+      --bd:      #0e1623;
+      --t1:      #e2e8f0;
+      --t2:      #64748b;
+      --t3:      #334155;
+      --green:   #22c55e;
+      --red:     #ef4444;
+      --amber:   #f59e0b;
+      --purple:  #818cf8;
+      --cyan:    #38bdf8;
+      --mono:    'SF Mono','Cascadia Code','Fira Code','JetBrains Mono',ui-monospace,monospace;
+    }
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     body {
-      background: #08080a;
-      color: #e5e5e5;
-      font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--t1);
+      font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', system-ui, sans-serif;
       font-size: 13px;
       min-height: 100vh;
     }
-    #header {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      padding: 12px 20px;
-      border-bottom: 1px solid #1a1a1e;
-      background: #08080a;
-      position: sticky;
-      top: 0;
-      z-index: 10;
-    }
-    .title   { font-size: 16px; font-weight: 600; letter-spacing: -0.02em; }
-    .version { color: #444; font-size: 12px; margin-left: 8px; }
-    .header-meta { display: flex; gap: 16px; align-items: center; font-size: 12px; color: #888; }
-    .status-group { display: flex; gap: 6px; align-items: center; }
-    .dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
-    .dot-green { background: #22c55e; animation: pg 2s ease-in-out infinite; }
-    .dot-amber { background: #f59e0b; animation: pa 0.7s ease-in-out infinite; }
-    .dot-red   { background: #ef4444; }
-    @keyframes pg { 0%,100%{opacity:1} 50%{opacity:0.4} }
-    @keyframes pa { 0%,100%{opacity:1} 50%{opacity:0.3} }
 
+    /* ── Header ───────────────────────────────────── */
+    #header {
+      display: flex; justify-content: space-between; align-items: center;
+      padding: 0 20px; height: 44px;
+      background: var(--raised); border-bottom: 1px solid var(--bs);
+      position: sticky; top: 0; z-index: 10;
+    }
+    .h-left  { display: flex; align-items: center; gap: 14px; }
+    .h-right { display: flex; align-items: center; gap: 20px; }
+    .brand { font-size: 15px; font-weight: 600; color: var(--purple); letter-spacing: -0.02em; }
+    .brand-ver { font-size: 10px; font-weight: 400; color: var(--t3); margin-left: 5px; }
+    .h-sep { width: 1px; height: 16px; background: var(--bs); }
+    .h-meta { font-size: 11px; color: var(--t2); font-family: var(--mono); }
+    .h-meta .v { color: var(--t1); }
+
+    /* Status pill */
+    .spill {
+      display: inline-flex; align-items: center; gap: 5px;
+      padding: 3px 10px 3px 7px; border-radius: 20px;
+      font-size: 11px; font-weight: 500;
+      background: var(--surface); border: 1px solid var(--bs); color: var(--t2);
+      transition: border-color 0.3s, color 0.3s;
+    }
+    .spill.live     { border-color: rgba(34,197,94,0.4);   color: #22c55e; }
+    .spill.scanning { border-color: rgba(245,158,11,0.4);  color: #f59e0b; }
+    .spill.dead     { border-color: rgba(239,68,68,0.3);   color: #ef4444; }
+    .sdot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; flex-shrink: 0; }
+    .live .sdot     { animation: alv 2.5s ease-in-out infinite; }
+    .scanning .sdot { animation: asc 0.8s ease-in-out infinite; }
+    @keyframes alv { 0%,100%{opacity:1} 50%{opacity:0.3} }
+    @keyframes asc { 0%,100%{opacity:1} 50%{opacity:0.2} }
+
+    /* ── Table ────────────────────────────────────── */
     #main-table { width: 100%; border-collapse: collapse; table-layout: fixed; }
     #main-table thead th {
-      padding: 10px 12px 8px;
-      color: #555;
-      font-weight: 500;
-      font-size: 11px;
-      text-transform: uppercase;
-      letter-spacing: 0.06em;
-      text-align: right;
-      border-bottom: 1px solid #1a1a1e;
-      white-space: nowrap;
-      user-select: none;
+      padding: 8px 12px; color: var(--t2);
+      font-size: 10px; font-weight: 500;
+      text-transform: uppercase; letter-spacing: 0.07em;
+      text-align: right; border-bottom: 1px solid var(--bs);
+      background: var(--raised); white-space: nowrap; user-select: none;
     }
     #main-table thead th.left { text-align: left; }
     #main-table td {
-      padding: 6px 12px;
-      border-bottom: 1px solid #0f0f12;
-      font-variant-numeric: tabular-nums;
-      text-align: right;
-      white-space: nowrap;
-      overflow: hidden;
+      padding: 0 12px; height: 38px;
+      border-bottom: 1px solid var(--b);
+      font-family: var(--mono); font-variant-numeric: tabular-nums;
+      font-size: 12px; text-align: right;
+      white-space: nowrap; overflow: hidden; vertical-align: middle;
     }
     #main-table td.left { text-align: left; }
     tr.data-row { cursor: pointer; }
-    tr.data-row:hover td { background: rgba(255,255,255,0.018); }
-    tr.data-row.is-expanded td { background: #0d0d10; }
-    tr.expand-row td { background: #0a0a0d; padding: 0; border: none; }
+    tr.data-row:hover td { background: var(--hover); }
+    tr.data-row.is-expanded td { background: var(--sel); }
+    tr.expand-row td { background: var(--sel); padding: 0; border-bottom: 2px solid var(--bs); }
 
-    .expand-inner {
-      padding: 16px 20px;
-      display: flex;
-      gap: 24px;
-      border-bottom: 1px solid #1a1a1e;
+    /* Score badges */
+    .sb {
+      display: inline-flex; align-items: center; justify-content: center;
+      min-width: 46px; padding: 2px 7px; border-radius: 4px;
+      font-size: 12.5px; font-weight: 700; font-family: var(--mono);
+      font-variant-numeric: tabular-nums; border: 1px solid transparent;
     }
-    .chart-area { flex: 1; overflow-x: auto; min-width: 0; }
+    .sb-crit { background: rgba(129,140,248,0.18); border-color: rgba(129,140,248,0.45); color: #a5b4fc; }
+    .sb-high { background: rgba(129,140,248,0.09); border-color: rgba(129,140,248,0.25); color: #818cf8; }
+    .sb-mid  { background: rgba(245,158,11,0.08);  border-color: rgba(245,158,11,0.22);  color: #f59e0b; }
+    .sb-low  { color: var(--t3); border-color: var(--bd); }
+
+    /* ── Expand panel ─────────────────────────────── */
+    .expand-inner { display: flex; flex-direction: column; }
+    .expand-chart { padding: 16px 20px 12px; }
     .chart-labels {
-      display: flex;
-      justify-content: space-between;
-      font-size: 10px;
-      color: #444;
-      margin-bottom: 5px;
+      display: flex; justify-content: space-between;
+      font-size: 10px; color: var(--t3);
+      font-family: var(--mono); margin-bottom: 6px;
     }
-    .stats-panel { width: 200px; flex-shrink: 0; font-size: 12px; }
-    .stat-item  { margin-bottom: 14px; }
-    .stat-label { color: #555; margin-bottom: 2px; font-size: 11px; }
-    .stat-value { color: #e5e5e5; font-size: 15px; font-variant-numeric: tabular-nums; font-weight: 500; }
-    .stat-sub   { color: #444; font-size: 11px; }
-    .expand-score { color: #e5e5e5; font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums; }
+    .exp-svg { display: block; width: 100%; }
+
+    .expand-stats {
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr 1.4fr auto;
+      background: var(--bg);
+      gap: 1px;
+      border-top: 1px solid var(--bs);
+    }
+    .sc {
+      background: var(--raised);
+      padding: 14px 16px;
+    }
+    .sc-label {
+      font-size: 10px; font-weight: 500;
+      text-transform: uppercase; letter-spacing: 0.07em;
+      color: var(--t2); margin-bottom: 6px;
+      font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+    }
+    .sc-val {
+      font-family: var(--mono); font-size: 22px; font-weight: 600;
+      color: var(--t1); font-variant-numeric: tabular-nums; line-height: 1;
+    }
+    .sc-sub {
+      font-size: 11px; color: var(--t3); margin-top: 4px;
+      font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+    }
+    .sc-score .sc-val { font-size: 32px; font-weight: 700; }
     .btn-open {
-      display: block;
-      padding: 8px 14px;
-      background: #1a1a1e;
-      color: #e5e5e5;
-      text-decoration: none;
-      font-size: 12px;
-      text-align: center;
-      margin-top: 4px;
+      display: flex; align-items: center; justify-content: center;
+      gap: 6px; padding: 0 20px; min-width: 110px;
+      background: var(--raised); border: none;
+      border-left: 1px solid var(--bg);
+      color: var(--cyan); font-size: 12px; font-weight: 500;
+      text-decoration: none; white-space: nowrap;
     }
-    .btn-open:hover { background: #222228; }
+    .btn-open:hover { background: var(--hover); }
 
     .vol-select {
-      background: transparent;
-      border: none;
-      color: #555;
-      font-size: 11px;
-      font-weight: 500;
-      text-transform: uppercase;
-      letter-spacing: 0.06em;
-      cursor: pointer;
-      outline: none;
+      background: transparent; border: none;
+      color: var(--t2); font-size: 10px; font-weight: 500;
+      text-transform: uppercase; letter-spacing: 0.07em;
+      cursor: pointer; outline: none;
     }
-    .vol-select option { background: #1a1a1e; color: #e5e5e5; }
-    .empty-msg { text-align: center !important; padding: 60px !important; color: #333; }
+    .vol-select option { background: var(--raised); color: var(--t1); }
+    .empty-msg { text-align: center !important; padding: 80px !important; color: var(--t2); font-family: var(--mono); }
+
+    /* ── Analysis Panel ───────────────────────── */
+    #analysis-panel {
+      display: flex; align-items: flex-start; gap: 16px;
+      padding: 10px 20px; background: var(--raised);
+      border-bottom: 1px solid var(--bs); min-height: 44px;
+    }
+    #analysis-text {
+      flex: 1; font-size: 12px; line-height: 1.65; color: var(--t3);
+      font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+      white-space: pre-line; align-self: center;
+    }
+    #analysis-text.has-content { color: var(--t1); }
+    .analysis-meta {
+      display: flex; flex-direction: column; align-items: flex-end;
+      gap: 6px; flex-shrink: 0;
+    }
+    #analysis-time { font-size: 10px; color: var(--t3); font-family: var(--mono); }
+    .spotter-btn {
+      padding: 5px 12px; border-radius: 4px; font-size: 11px; font-weight: 500;
+      cursor: pointer; border: 1px solid var(--bs); background: var(--surface);
+      color: var(--t2); transition: border-color 0.2s, color 0.2s; white-space: nowrap;
+    }
+    .spotter-btn:hover { border-color: var(--cyan); color: var(--cyan); }
+    .spotter-btn.active { border-color: rgba(34,197,94,0.5); color: var(--green); }
+    .spotter-btn.calling { border-color: rgba(245,158,11,0.4); color: var(--amber); }
+
+    /* ── Faded Section ────────────────────────── */
+    #faded-section { display: none; }
+    .faded-header {
+      padding: 10px 20px 4px; font-size: 10px; font-weight: 500;
+      text-transform: uppercase; letter-spacing: 0.07em; color: var(--t3);
+    }
+    .faded-row {
+      display: flex; align-items: center; gap: 20px; padding: 5px 20px;
+      opacity: 0.4; font-family: var(--mono); font-size: 11px; color: var(--t2);
+      border-bottom: 1px solid var(--b);
+    }
+    .faded-row:hover { opacity: 0.65; }
+    .faded-sym  { min-width: 70px; font-weight: 500; color: var(--t2); }
+    .faded-score { min-width: 70px; }
+    .faded-dur  { min-width: 40px; color: var(--t3); }
+    .faded-bp   { min-width: 50px; }
+
+    /* ── Research panel ───────────────────────── */
+    .expand-research {
+      padding: 12px 16px; background: var(--raised);
+      border-top: 1px solid var(--bs);
+    }
+    .btn-research {
+      padding: 5px 12px; border-radius: 4px; font-size: 11px; font-weight: 500;
+      cursor: pointer; border: 1px solid var(--bs); background: var(--surface);
+      color: var(--cyan); transition: border-color 0.15s;
+    }
+    .btn-research:hover:not(:disabled) { border-color: var(--cyan); }
+    .btn-research:disabled { opacity: 0.45; cursor: default; }
+    .research-output { margin-top: 12px; }
+    .research-text {
+      font-size: 12px; line-height: 1.7; color: var(--t1); white-space: pre-line;
+      font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+    }
+    .research-time { font-size: 10px; color: var(--t3); margin-top: 6px; font-family: var(--mono); }
   </style>
 </head>
 <body>
 
 <div id="header">
-  <div>
-    <span class="title">&#x092A;&#x094D;&#x0930;&#x0924;&#x093F; Prati</span>
-    <span class="version">v0.1</span>
-  </div>
-  <div class="header-meta">
-    <div class="status-group">
-      <span class="dot dot-red" id="status-dot"></span>
+  <div class="h-left">
+    <div class="brand">&#x092A;&#x094D;&#x0930;&#x0924;&#x093F; Prati<span class="brand-ver">v0.1</span></div>
+    <div class="h-sep"></div>
+    <div class="spill" id="spill">
+      <span class="sdot"></span>
       <span id="status-label">Connecting&hellip;</span>
     </div>
-    <span id="eligible" style="color:#666;"></span>
-    <span id="duration" style="color:#666;"></span>
-    <span id="scan-time" style="color:#444;font-size:11px;"></span>
+  </div>
+  <div class="h-right">
+    <span class="h-meta" id="eligible"></span>
+    <span class="h-meta" id="duration"></span>
+    <span id="scan-time" style="font-size:10px;color:var(--t3);font-family:var(--mono);"></span>
+    <button onclick="toggleDevLog()" style="padding:3px 9px;border-radius:4px;font-size:10px;font-weight:500;cursor:pointer;border:1px solid var(--bs);background:var(--surface);color:var(--t3);font-family:var(--mono);">dev</button>
+  </div>
+</div>
+
+<div id="dev-panel" style="display:none;position:fixed;bottom:0;left:0;right:0;height:280px;background:#050810;border-top:1px solid #1e2d45;z-index:100;flex-direction:column;">
+  <div style="display:flex;justify-content:space-between;align-items:center;padding:6px 16px;border-bottom:1px solid #1e2d45;">
+    <span style="font-size:10px;font-weight:500;color:#334155;font-family:monospace;text-transform:uppercase;letter-spacing:.06em;">Dev Log</span>
+    <div style="display:flex;gap:10px;">
+      <button onclick="window.copyLog()" style="padding:2px 8px;border-radius:3px;font-size:10px;cursor:pointer;border:1px solid #1e2d45;background:#0d1117;color:#64748b;">Copy</button>
+      <button onclick="window.toggleDevLog()" style="padding:2px 8px;border-radius:3px;font-size:10px;cursor:pointer;border:1px solid #1e2d45;background:#0d1117;color:#64748b;">Close</button>
+    </div>
+  </div>
+  <pre id="dev-log-content" style="flex:1;overflow-y:auto;margin:0;padding:10px 16px;font-size:11px;line-height:1.6;color:#64748b;font-family:monospace;white-space:pre-wrap;word-break:break-all;"></pre>
+</div>
+
+<div id="analysis-panel">
+  <div id="analysis-text">Spotters inactive. Click Start to enable AI analysis.</div>
+  <div class="analysis-meta">
+    <span id="analysis-time"></span>
+    <button class="spotter-btn" id="spotter-btn" onclick="toggleSpotters()">Start Spotters</button>
   </div>
 </div>
 
 <table id="main-table">
   <colgroup>
-    <col style="width:40px">
+    <col style="width:44px">
     <col style="width:110px">
-    <col style="width:68px">
+    <col style="width:88px">
     <col style="width:52px">
-    <col style="width:90px">
-    <col style="width:80px">
+    <col style="width:96px">
+    <col style="width:82px">
     <col style="width:72px">
-    <col style="width:60px">
-    <col style="width:52px">
+    <col style="width:62px">
+    <col style="width:54px">
     <col>
   </colgroup>
   <thead>
@@ -431,13 +782,35 @@ function getDashboardHTML() {
   </tbody>
 </table>
 
+<div id="faded-section">
+  <div class="faded-header">Recently Faded</div>
+  <div id="faded-list"></div>
+</div>
+
 <script>
 (function () {
   var currentData    = null;
   var expandedSymbol = null;
   var volPeriod      = 5;
+  var lastScanAt     = null;
+  var knownTriples   = new Set();
+  var analysisAt     = null;
 
-  // Vol period selector
+  // Live "Scanned Xs ago" counter
+  setInterval(function () {
+    if (!lastScanAt) return;
+    var s = Math.floor((Date.now() - lastScanAt) / 1000);
+    document.getElementById('scan-time').textContent = 'Scanned ' + s + 's ago';
+  }, 1000);
+
+  // Live "Analysis: Xs ago" counter
+  setInterval(function () {
+    if (!analysisAt) return;
+    var s = Math.floor((Date.now() - analysisAt) / 1000);
+    var el = document.getElementById('analysis-time');
+    if (el) el.textContent = 'Analysis: ' + s + 's ago';
+  }, 5000);
+
   var volSelect = document.getElementById('vol-select');
   volSelect.addEventListener('change', function (e) {
     e.stopPropagation();
@@ -456,23 +829,32 @@ function getDashboardHTML() {
         setStatus('scanning');
       } else if (data.type === 'scan') {
         currentData = data;
+        lastScanAt  = Date.now();
         setStatus('live');
-        document.getElementById('eligible').textContent  = data.eligibleCount + ' tickers';
-        document.getElementById('duration').textContent  = data.duration + 's';
-        document.getElementById('scan-time').textContent = data.scanTime;
+        document.getElementById('eligible').innerHTML = '<span class="v">' + data.eligibleCount + '</span> tickers';
+        document.getElementById('duration').innerHTML = '<span class="v">' + data.duration + 's</span>';
         renderTable(data.results);
+        renderFaded(data.expired || []);
+        checkTripleNotifications(data.results);
+      } else if (data.type === 'analysis') {
+        setAnalysis(data.text);
+      } else if (data.type === 'spotter_status') {
+        setSpotterStatus(data.active, data.calling || false);
+      } else if (data.type === 'spotter_calling') {
+        setSpotterStatus(true, true);
       }
     } catch (_) {}
   };
 
-  es.onerror = function () { setStatus('disconnected'); };
+  es.onerror = function () { setStatus('dead'); };
 
   function setStatus(s) {
-    var dot   = document.getElementById('status-dot');
+    var pill  = document.getElementById('spill');
     var label = document.getElementById('status-label');
-    if (s === 'live')         { dot.className = 'dot dot-green'; label.textContent = 'Live'; }
-    else if (s === 'scanning') { dot.className = 'dot dot-amber'; label.textContent = 'Scanning\u2026'; }
-    else                       { dot.className = 'dot dot-red';   label.textContent = 'Disconnected'; }
+    pill.className = 'spill';
+    if (s === 'live')          { pill.classList.add('live');     label.textContent = 'Live'; }
+    else if (s === 'scanning') { pill.classList.add('scanning'); label.textContent = 'Scanning\u2026'; }
+    else                       { pill.classList.add('dead');     label.textContent = 'Disconnected'; }
   }
 
   // ── Table rendering ───────────────────────────────────────────────────────
@@ -504,50 +886,53 @@ function getDashboardHTML() {
     }
   }
 
+  function scoreBadge(score) {
+    var cls = score > 25 ? 'sb sb-crit' : score > 15 ? 'sb sb-high' : score >= 5 ? 'sb sb-mid' : 'sb sb-low';
+    return '<span class="' + cls + '">' + score.toFixed(1) + '</span>';
+  }
+
   function renderRow(r, i) {
     var triple  = r.score > 15 && r.conc > 40 && r.bp > 80;
-    var rowBg   = triple ? 'background:rgba(245,158,11,0.03);' : '';
-    var leftBdr = i === 0 ? 'border-left:2px solid #f59e0b;' : 'border-left:2px solid transparent;';
-
-    var scoreStyle = r.score > 20 ? 'font-weight:700;color:#e5e5e5;'
-                   : r.score < 5  ? 'color:#444;'
-                   : '';
+    var rowBg   = triple ? 'background:rgba(245,158,11,0.05);' : '';
+    var leftBdr = (i === 0 || triple)
+      ? 'border-left:2px solid #f59e0b;'
+      : 'border-left:2px solid transparent;';
 
     var ageText  = r.age === 0 ? '<1m' : r.age + 'm';
-    var ageStyle = r.age < 5   ? 'color:#f59e0b;font-weight:600;'
-                 : r.age > 15  ? 'opacity:0.4;'
+    var ageStyle = r.age < 5  ? 'color:#f59e0b;font-weight:600;'
+                 : r.age > 15 ? 'opacity:0.35;'
                  : '';
 
     var vol      = calcVolPct(r.miniCandles, volPeriod);
     // Only fall back to backend value when period matches; otherwise show — to avoid mislabelling
     if (vol === null && volPeriod === 5) vol = r.vol5m;
-    var volStyle = vol === null ? 'color:#555;' : vol >= 0 ? 'color:#22c55e;' : 'color:#ef4444;';
+    var volStyle = vol === null ? 'color:#334155;' : vol >= 0 ? 'color:#22c55e;' : 'color:#ef4444;';
 
     var vol1hStyle = r.vol1h >= 0 ? 'color:#22c55e;' : 'color:#ef4444;';
 
     var concStyle = r.conc > 60 ? 'color:#ef4444;font-weight:600;'
                   : r.conc > 40 ? 'color:#f59e0b;font-weight:600;'
-                  : 'color:#888;';
+                  : 'color:#334155;';
 
-    var bpStyle = r.bp > 80  ? 'color:#22c55e;font-weight:600;'
-                : r.bp < 30  ? 'color:#ef4444;font-weight:600;'
-                : 'color:#888;';
+    var bpStyle = r.bp > 80 ? 'color:#22c55e;font-weight:600;'
+                : r.bp < 30 ? 'color:#ef4444;font-weight:600;'
+                : 'color:#334155;';
 
     var abnStyle = r.consecutiveAbnormal >= 5 ? 'color:#ef4444;font-weight:700;'
                  : r.consecutiveAbnormal >= 4 ? 'color:#f59e0b;'
-                 : r.consecutiveAbnormal >= 3 ? 'color:#eab308;'
-                 : 'color:#555;';
+                 : r.consecutiveAbnormal >= 3 ? 'color:#fde68a;'
+                 : 'color:#334155;';
 
     var sym        = r.symbol.replace(/USDT$/, '');
-    var bitunixUrl = 'https://www.bitunix.com/es-es/futures-trade/' + r.symbol;
+    var bitunixUrl = 'https://www.bitunix.com/es-es/contract-trade/' + r.symbol;
     var miniSvg    = (r.miniCandles && r.miniCandles.length > 0)
                      ? buildMiniSvg(r.miniCandles, r.baselineAvg) : '';
 
     return '<tr class="data-row" data-symbol="' + r.symbol + '" style="' + rowBg + leftBdr + '">' +
-      '<td style="color:#555;">' + (i + 1) + '</td>' +
+      '<td style="color:#334155;font-size:11px;">' + (i + 1) + '</td>' +
       '<td class="left"><a href="' + bitunixUrl + '" target="_blank" onclick="event.stopPropagation()" ' +
-        'style="color:#e5e5e5;text-decoration:none;font-weight:500;">' + sym + '</a></td>' +
-      '<td style="' + scoreStyle + '">' + r.score.toFixed(1) + '</td>' +
+        'style="color:#38bdf8;text-decoration:none;font-weight:500;">' + sym + '</a></td>' +
+      '<td>' + scoreBadge(r.score) + '</td>' +
       '<td style="' + ageStyle + '">' + ageText + '</td>' +
       '<td style="' + volStyle + '">' + (vol === null ? '\u2014' : fmtPct(vol)) + '</td>' +
       '<td style="' + vol1hStyle + '">' + fmtPct(r.vol1h) + '</td>' +
@@ -566,7 +951,7 @@ function getDashboardHTML() {
     }
     if (maxVol === 0) return '';
 
-    var bW = 3, bG = 1, h = 36;
+    var bW = 4, bG = 1, h = 52;
     var totalW = candles.length * (bW + bG) - bG;
     var baseH  = Math.min(h - 1, Math.max(1, (baselineAvg / maxVol) * h));
     var baseY  = (h - baseH).toFixed(1);
@@ -574,18 +959,18 @@ function getDashboardHTML() {
     var parts = [
       '<svg width="' + totalW + '" height="' + h + '" style="display:block;vertical-align:middle">',
       '<line x1="0" y1="' + baseY + '" x2="' + totalW + '" y2="' + baseY +
-        '" stroke="#2a2a2e" stroke-dasharray="3,2" stroke-width="1"/>'
+        '" stroke="#1e3a5f" stroke-dasharray="2,3" stroke-width="1"/>'
     ];
 
     for (var i = 0; i < candles.length; i++) {
       var c    = candles[i];
       var x    = i * (bW + bG);
-      var bH   = Math.max(1, (c.baseVol / maxVol) * h);
+      var bH   = Math.max(2, (c.baseVol / maxVol) * h);
       var y    = (h - bH).toFixed(1);
       var isR  = i >= candles.length - 5;
       var fill = c.close >= c.open ? '#22c55e' : '#ef4444';
       parts.push('<rect x="' + x + '" y="' + y + '" width="' + bW + '" height="' + bH.toFixed(1) +
-        '" fill="' + fill + '" opacity="' + (isR ? '1' : '0.28') + '"/>');
+        '" fill="' + fill + '" opacity="' + (isR ? '1' : '0.22') + '"/>');
     }
 
     parts.push('</svg>');
@@ -607,7 +992,7 @@ function getDashboardHTML() {
     expTr.className = 'expand-row';
     expTr.id        = 'expand-row';
     expTr.innerHTML = '<td colspan="10"><div class="expand-inner">' +
-      '<div style="flex:1;color:#444;font-size:12px;">Loading\u2026</div>' +
+      '<div style="padding:24px 20px;color:#64748b;font-size:12px;font-family:var(--mono);">Loading\u2026</div>' +
       '</div></td>';
     row.insertAdjacentElement('afterend', expTr);
 
@@ -619,7 +1004,7 @@ function getDashboardHTML() {
       .catch(function () {
         clearTimeout(fetchTimer);
         var inner = document.querySelector('#expand-row .expand-inner');
-        if (inner) inner.innerHTML = '<div style="color:#ef4444;font-size:12px;">Failed to load klines</div>';
+        if (inner) inner.innerHTML = '<div style="padding:24px 20px;color:#ef4444;font-size:12px;">Failed to load klines</div>';
       });
   }
 
@@ -639,7 +1024,7 @@ function getDashboardHTML() {
     if (!inner) return;
 
     var result = currentData && currentData.results.find(function (r) { return r.symbol === symbol; });
-    if (!result) { inner.innerHTML = '<div style="color:#444;font-size:12px;">Data not found</div>'; return; }
+    if (!result) { inner.innerHTML = '<div style="padding:20px;color:#64748b;font-size:12px;">Data not found</div>'; return; }
 
     var maxVol = 0;
     for (var i = 0; i < candles.length; i++) {
@@ -647,59 +1032,77 @@ function getDashboardHTML() {
       if (v > maxVol) maxVol = v;
     }
 
-    var bW = 2, bG = 1, bH = 80;
-    var totalW = candles.length * (bW + bG) - bG;
-    var baseH  = maxVol > 0 ? Math.min(bH - 1, Math.max(1, (result.baselineAvg / maxVol) * bH)) : 1;
-    var baseY  = (bH - baseH).toFixed(1);
+    // Responsive SVG via viewBox — fills full container width, no empty space
+    var bW = 3, bH = 100;
+    var totalViewW = candles.length * (bW + 1) - 1;
+    var baseViewH  = maxVol > 0 ? Math.min(bH - 1, Math.max(1, (result.baselineAvg / maxVol) * bH)) : 1;
+    var baseViewY  = (bH - baseViewH).toFixed(1);
 
     var bars = [
-      '<svg width="' + totalW + '" height="' + bH + '" style="display:block">',
-      '<line x1="0" y1="' + baseY + '" x2="' + totalW + '" y2="' + baseY +
-        '" stroke="#2a2a2e" stroke-dasharray="3,2" stroke-width="1"/>'
+      '<svg viewBox="0 0 ' + totalViewW + ' ' + bH + '" preserveAspectRatio="none" class="exp-svg" style="height:100px">',
+      '<line x1="0" y1="' + baseViewY + '" x2="' + totalViewW + '" y2="' + baseViewY +
+        '" stroke="#1e3a5f" stroke-dasharray="4,3" stroke-width="1" vector-effect="non-scaling-stroke"/>'
     ];
 
     for (var i = 0; i < candles.length; i++) {
       var c    = candles[i];
       var vol  = parseFloat(c.baseVol);
-      var x    = i * (bW + bG);
+      var x    = i * (bW + 1);
       var barH = maxVol > 0 ? Math.max(1, (vol / maxVol) * bH) : 1;
       var y    = (bH - barH).toFixed(1);
       var isR  = i >= candles.length - 5;
       var fill = parseFloat(c.close) >= parseFloat(c.open) ? '#22c55e' : '#ef4444';
       bars.push('<rect x="' + x + '" y="' + y + '" width="' + bW + '" height="' + barH.toFixed(1) +
-        '" fill="' + fill + '" opacity="' + (isR ? '1' : '0.35') + '"/>');
+        '" fill="' + fill + '" opacity="' + (isR ? '1' : '0.28') + '"/>');
     }
     bars.push('</svg>');
 
-    var bitunixUrl = 'https://www.bitunix.com/es-es/futures-trade/' + symbol;
+    var bitunixUrl = 'https://www.bitunix.com/es-es/contract-trade/' + symbol;
+    var sym        = symbol.replace(/USDT$/, '');
+
+    var scoreColor = result.score > 25 ? '#a5b4fc'
+                   : result.score > 15 ? '#818cf8'
+                   : result.score >= 5 ? '#f59e0b'
+                   : '#334155';
+    var abnColor   = result.consecutiveAbnormal >= 5 ? '#ef4444'
+                   : result.consecutiveAbnormal >= 4 ? '#f59e0b'
+                   : '#e2e8f0';
 
     inner.innerHTML =
-      '<div class="chart-area">' +
+      '<div class="expand-chart">' +
         '<div class="chart-labels"><span>4h ago</span><span>baseline \u2014\u2014</span><span>now</span></div>' +
         bars.join('') +
       '</div>' +
-      '<div class="stats-panel">' +
-        '<div class="stat-item">' +
-          '<div class="stat-label">Baseline (4h avg)</div>' +
-          '<div class="stat-value">' + fmtVol(result.baselineAvg) + '</div>' +
-          '<div class="stat-sub">per 1m candle</div>' +
+      '<div class="expand-stats">' +
+        '<div class="sc">' +
+          '<div class="sc-label">Baseline (4h avg)</div>' +
+          '<div class="sc-val">' + fmtVol(result.baselineAvg) + '</div>' +
+          '<div class="sc-sub">per 1m candle</div>' +
         '</div>' +
-        '<div class="stat-item">' +
-          '<div class="stat-label">Recent avg (5 candles)</div>' +
-          '<div class="stat-value">' + fmtVol(result.recentAvg) + '</div>' +
-          '<div class="stat-sub">' + result.avgRatio.toFixed(1) + 'x baseline</div>' +
+        '<div class="sc">' +
+          '<div class="sc-label">Recent avg (5 candles)</div>' +
+          '<div class="sc-val">' + fmtVol(result.recentAvg) + '</div>' +
+          '<div class="sc-sub">' + result.avgRatio.toFixed(1) + '\u00d7 baseline</div>' +
         '</div>' +
-        '<div class="stat-item">' +
-          '<div class="stat-label">Abnormal candles</div>' +
-          '<div class="stat-value">' + result.consecutiveAbnormal + '/5</div>' +
-          '<div class="stat-sub">above 3\u00d7 threshold</div>' +
+        '<div class="sc">' +
+          '<div class="sc-label">Abnormal candles</div>' +
+          '<div class="sc-val" style="color:' + abnColor + '">' + result.consecutiveAbnormal + '/5</div>' +
+          '<div class="sc-sub">above 3\u00d7 threshold</div>' +
         '</div>' +
-        '<div class="stat-item">' +
-          '<div class="stat-label">Breakout score</div>' +
-          '<div class="expand-score">' + result.score.toFixed(1) + '</div>' +
-          '<div class="stat-sub">ratio \u00d7 consecutive</div>' +
+        '<div class="sc sc-score">' +
+          '<div class="sc-label">Breakout score</div>' +
+          '<div class="sc-val" style="color:' + scoreColor + '">' + result.score.toFixed(1) + '</div>' +
+          '<div class="sc-sub">ratio \u00d7 consecutive</div>' +
         '</div>' +
-        '<a class="btn-open" href="' + bitunixUrl + '" target="_blank">Open in Bitunix \u2192</a>' +
+        '<a class="btn-open" href="' + bitunixUrl + '" target="_blank">' +
+          sym + ' \u2192' +
+        '</a>' +
+      '</div>' +
+      '<div class="expand-research">' +
+        '<button class="btn-research" id="rbtn-' + symbol + '" onclick="triggerResearch(\\x27' + symbol + '\\x27)">' +
+          '🔬 Deep Analysis' +
+        '</button>' +
+        '<div class="research-output" id="rout-' + symbol + '" style="display:none"></div>' +
       '</div>';
   }
 
@@ -707,8 +1110,8 @@ function getDashboardHTML() {
   function calcVolPct(candles, period) {
     if (!candles || candles.length < period * 2) return null;
     var last = 0, prior = 0, n = candles.length;
-    for (var i = n - period; i < n; i++)           last  += candles[i].baseVol;
-    for (var i = n - period * 2; i < n - period; i++) prior += candles[i].baseVol;
+    for (var i = n - period; i < n; i++)               last  += candles[i].baseVol;
+    for (var i = n - period * 2; i < n - period; i++)  prior += candles[i].baseVol;
     return prior > 0 ? (last / prior - 1) * 100 : 0;
   }
 
@@ -722,6 +1125,139 @@ function getDashboardHTML() {
     if (v >= 1000)    return (v / 1000).toFixed(1) + 'K';
     return v.toFixed(0);
   }
+
+  // ── Spotter controls ──────────────────────────────────────────────────────
+  function toggleSpotters() {
+    fetch('/api/spotters/toggle', { method: 'POST' })
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        if (d.error) { alert(d.error); return; }
+        setSpotterStatus(d.active, false);
+        if (d.active && 'Notification' in window && Notification.permission === 'default') {
+          Notification.requestPermission();
+        }
+      })
+      .catch(function () { alert('Could not reach server'); });
+  }
+
+  function setSpotterStatus(active, calling) {
+    var btn = document.getElementById('spotter-btn');
+    btn.className = 'spotter-btn' + (calling ? ' calling' : active ? ' active' : '');
+    btn.textContent = calling ? 'Analyzing\u2026' : active ? 'Stop Spotters' : 'Start Spotters';
+    var txt = document.getElementById('analysis-text');
+    if (!active && !calling && !txt.classList.contains('has-content')) {
+      txt.textContent = 'Spotters inactive. Click Start to enable AI analysis.';
+    }
+    if (active && !calling && !txt.classList.contains('has-content')) {
+      txt.textContent = 'Spotters active \u2014 waiting for signals\u2026';
+    }
+  }
+
+  function setAnalysis(text) {
+    var txt = document.getElementById('analysis-text');
+    txt.textContent = text;
+    txt.classList.add('has-content');
+    analysisAt = Date.now();
+    document.getElementById('analysis-time').textContent = 'Analysis: just now';
+  }
+
+  // ── Recently faded ────────────────────────────────────────────────────────
+  function renderFaded(expired) {
+    var section = document.getElementById('faded-section');
+    if (!expired || expired.length === 0) { section.style.display = 'none'; return; }
+    section.style.display = 'block';
+    document.getElementById('faded-list').innerHTML = expired.map(function (e) {
+      var bpStyle = e.finalBP > 60 ? 'color:#22c55e' : e.finalBP < 30 ? 'color:#ef4444' : '';
+      var sym     = e.symbol.replace(/USDT$/, '');
+      return '<div class="faded-row">' +
+        '<span class="faded-sym">' + sym + '</span>' +
+        '<span class="faded-score">Score ' + e.peakScore.toFixed(1) + '</span>' +
+        '<span class="faded-dur">' + e.duration + 'm</span>' +
+        '<span class="faded-bp" style="' + bpStyle + '">BP ' + e.finalBP + '%</span>' +
+        '</div>';
+    }).join('');
+  }
+
+  // ── Browser notifications ─────────────────────────────────────────────────
+  function checkTripleNotifications(results) {
+    if (!results) return;
+    var currentTriples = new Set();
+    results.forEach(function (r) {
+      if (r.score > 15 && r.conc > 40 && r.bp > 80) {
+        currentTriples.add(r.symbol);
+        if (!knownTriples.has(r.symbol)) fireNotification(r);
+      }
+    });
+    knownTriples = currentTriples;
+  }
+
+  function fireNotification(r) {
+    if (!('Notification' in window) || Notification.permission !== 'granted') return;
+    new Notification('\u26a1 ' + r.symbol.replace(/USDT$/, '') + ' \u2014 Triple Confirmation', {
+      body: 'Score ' + r.score.toFixed(1) + ' \u00b7 BP ' + r.bp + '% \u00b7 Conc ' + r.conc.toFixed(0) + '%',
+      tag:  r.symbol,
+    });
+  }
+
+  // ── AI Research ───────────────────────────────────────────────────────────
+  // ── Dev log ───────────────────────────────────────────────────────────────
+  var devPanelOpen = false;
+  function toggleDevLog() {
+    devPanelOpen = !devPanelOpen;
+    var panel = document.getElementById('dev-panel');
+    panel.style.display = devPanelOpen ? 'flex' : 'none';
+    if (devPanelOpen) refreshLog();
+  }
+  function refreshLog() {
+    fetch('/api/log')
+      .then(function (r) { return r.text(); })
+      .then(function (t) {
+        var el = document.getElementById('dev-log-content');
+        el.textContent = t || '(no log entries yet)';
+      });
+  }
+  function copyLog() {
+    fetch('/api/log')
+      .then(function (r) { return r.text(); })
+      .then(function (t) { navigator.clipboard.writeText(t); });
+  }
+
+  // Expose to global scope for onclick handlers
+  window.toggleDevLog   = toggleDevLog;
+  window.copyLog        = copyLog;
+  window.toggleSpotters = toggleSpotters;
+  window.triggerResearch = triggerResearch;
+
+  function triggerResearch(symbol) {
+    var btn = document.getElementById('rbtn-' + symbol);
+    var out = document.getElementById('rout-' + symbol);
+    if (!btn || !out) return;
+    btn.textContent = 'Analyzing\u2026';
+    btn.disabled = true;
+    out.style.display = 'none';
+    var ctrl  = new AbortController();
+    var timer = setTimeout(function () { ctrl.abort(); }, 35000);
+    fetch('/api/research/' + symbol, { method: 'POST', signal: ctrl.signal })
+      .then(function (r) { clearTimeout(timer); return r.json(); })
+      .then(function (d) {
+        if (d.error) {
+          out.innerHTML = '<span style="color:#ef4444">Error: ' + d.error + '</span>';
+        } else {
+          out.innerHTML = '<div class="research-text">' + d.text.replace(/\n/g, '<br>') + '</div>' +
+            '<div class="research-time">' + d.generatedAt + '</div>';
+        }
+        out.style.display = 'block';
+        btn.textContent = '🔬 Re-analyze';
+        btn.disabled = false;
+      })
+      .catch(function () {
+        clearTimeout(timer);
+        out.innerHTML = '<span style="color:#ef4444">Request failed or timed out</span>';
+        out.style.display = 'block';
+        btn.textContent = '🔬 Deep Analysis';
+        btn.disabled = false;
+      });
+  }
 }());
 </script>
 
@@ -733,10 +1269,11 @@ function getDashboardHTML() {
 
 function startServer() {
   const app = express();
+  app.use(express.json());
 
   app.get('/', (_req, res) => {
-    res.setHeader('Content-Type', 'text/html; charset=utf-8');
-    res.send(getDashboardHTML());
+    res.setHeader('Cache-Control', 'no-store');
+    res.sendFile(path.join(__dirname, 'dashboard.html'));
   });
 
   app.get('/api/stream', (req, res) => {
@@ -747,20 +1284,186 @@ function startServer() {
 
     // Send current state immediately on connect
     if (latestResults.length > 0) {
-      res.write(`data: ${JSON.stringify({ type: 'scan', ...latestMeta, results: latestResults })}\n\n`);
+      res.write(`data: ${JSON.stringify({ type: 'scan', ...latestMeta, results: latestResults, expired: [...recentlyExpired.values()] })}\n\n`);
     }
     if (isScanning) {
       res.write(`data: ${JSON.stringify({ type: 'scanning' })}\n\n`);
+    }
+    // Send pin state + any existing commentary
+    res.write(`data: ${JSON.stringify({ type: 'pins', pins: [...pinnedTickers] })}\n\n`);
+    for (const [sym, c] of pinCommentary) {
+      res.write(`data: ${JSON.stringify({ type: 'pin_commentary', symbol: sym, ...c })}\n\n`);
     }
 
     sseClients.push(res);
     req.on('close', () => { sseClients = sseClients.filter(c => c !== res); });
   });
 
+  // ── Pin management ──────────────────────────────────────────────────────────
+  app.get('/api/pins', (_req, res) => {
+    const pins = [...pinnedTickers].map(sym => ({
+      symbol:     sym,
+      data:       latestResults.find(r => r.symbol === sym) || null,
+      commentary: pinCommentary.get(sym) || null,
+    }));
+    res.json(pins);
+  });
+
+  app.post('/api/pins/:symbol', (req, res) => {
+    pinnedTickers.add(req.params.symbol);
+    pushSSE({ type: 'pins', pins: [...pinnedTickers] });
+    log('PIN', `pinned ${req.params.symbol}`);
+    res.json({ pinned: true, symbol: req.params.symbol });
+  });
+
+  app.delete('/api/pins/:symbol', (req, res) => {
+    pinnedTickers.delete(req.params.symbol);
+    pinCommentary.delete(req.params.symbol);
+    pinLastCommentary.delete(req.params.symbol);
+    pushSSE({ type: 'pins', pins: [...pinnedTickers] });
+    log('PIN', `unpinned ${req.params.symbol}`);
+    res.json({ pinned: false, symbol: req.params.symbol });
+  });
+
+  // ── Chat ─────────────────────────────────────────────────────────────────────
+  app.post('/api/chat', async (req, res) => {
+    if (!process.env.ANTHROPIC_API_KEY) {
+      return res.status(503).json({ error: 'ANTHROPIC_API_KEY not set — add it to START.command' });
+    }
+    const { message, history } = req.body;
+    if (!message) return res.status(400).json({ error: 'No message' });
+
+    // Scan summary (top 15, compact)
+    const signals = latestResults.slice(0, 15).map(r => ({
+      sym:   r.symbol.replace(/USDT$/, ''),
+      score: +r.score.toFixed(1),
+      age:   r.age,
+      bp:    r.bp,
+      conc:  +r.conc.toFixed(0),
+      vol5m: +r.vol5m.toFixed(0),
+      abn:   r.consecutiveAbnormal,
+      triple: r.score > 15 && r.conc > 40 && r.bp > 80,
+    }));
+
+    // Detect mentioned tickers
+    const upper     = message.toUpperCase();
+    const mentioned = [];
+    for (const sym of klineCache.keys()) {
+      const short = sym.replace(/USDT$/, '');
+      if (short.length >= 3 && upper.includes(short)) mentioned.push(sym);
+    }
+
+    // Build kline + trajectory context for mentioned tickers
+    const klines = {};
+    const trajectory = {};
+    for (const sym of mentioned) {
+      const short = sym.replace(/USDT$/, '');
+      const cached = klineCache.get(sym);
+      if (cached) {
+        klines[short] = cached.slice(-60).map(c => ({
+          time: c.time, open: c.open, close: c.close, vol: c.baseVol,
+        }));
+      }
+      const traj = recentScans
+        .map(s => s.results.find(r => r.symbol === sym))
+        .filter(Boolean)
+        .map(r => ({ score: +r.score.toFixed(1), bp: r.bp, conc: +r.conc.toFixed(0) }));
+      if (traj.length) trajectory[short] = traj;
+    }
+
+    const context = {
+      scanTime: latestMeta.scanTime,
+      pinned:   [...pinnedTickers].map(s => s.replace(/USDT$/, '')),
+      signals,
+      ...(Object.keys(klines).length      && { klines }),
+      ...(Object.keys(trajectory).length  && { trajectory }),
+    };
+
+    // Ensure history alternates correctly (must start with user)
+    let hist = (history || []).slice(-8);
+    if (hist.length && hist[0].role !== 'user') hist = hist.slice(1);
+
+    const messages = [
+      ...hist,
+      { role: 'user', content: `Context:\n${JSON.stringify(context)}\n\nQuestion: ${message}` },
+    ];
+
+    try {
+      const data = await postJson(ANTHROPIC_API_URL, {
+        model: 'claude-sonnet-4-6', max_tokens: 400,
+        system: CHAT_SYSTEM_PROMPT,
+        messages,
+      }, { 'x-api-key': process.env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' });
+      res.json({ text: data.content[0].text, at: now() });
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
   app.get('/api/klines/:symbol', (req, res) => {
     const candles = klineCache.get(req.params.symbol);
     if (!candles) return res.status(404).json({ error: 'not in cache' });
     res.json(candles);
+  });
+
+  app.get('/api/log', (_req, res) => {
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    res.send(devLog.slice().reverse().join('\n'));
+  });
+
+  app.post('/api/spotters/toggle', (_req, res) => {
+    if (!process.env.ANTHROPIC_API_KEY) {
+      return res.status(503).json({ error: 'ANTHROPIC_API_KEY not set' });
+    }
+    spottersActive = !spottersActive;
+    if (!spottersActive) spotterCalling = false;
+    pushSSE({ type: 'spotter_status', active: spottersActive, calling: false });
+    res.json({ active: spottersActive });
+  });
+
+  app.post('/api/research/:symbol', async (req, res) => {
+    if (!process.env.ANTHROPIC_API_KEY) {
+      return res.status(503).json({ error: 'ANTHROPIC_API_KEY not set' });
+    }
+    const symbol  = req.params.symbol;
+    const candles = klineCache.get(symbol);
+    if (!candles) return res.status(404).json({ error: 'not in cache' });
+    const current = latestResults.find(r => r.symbol === symbol);
+    if (!current)  return res.status(404).json({ error: 'not in current results' });
+
+    const trajectory = recentScans
+      .map(s => s.results.find(r => r.symbol === symbol))
+      .filter(Boolean)
+      .map(r => ({ score: r.score, conc: r.conc, bp: r.bp, age: r.age }));
+
+    const payload = {
+      ticker: symbol,
+      currentMetrics: {
+        score: current.score, age: current.age, vol5m: current.vol5m,
+        vol1h: current.vol1h, conc: current.conc, bp: current.bp,
+        consecutiveAbnormal: current.consecutiveAbnormal,
+        baselineAvg: current.baselineAvg, recentAvg: current.recentAvg,
+      },
+      trajectory,
+      candles: candles.slice(-60).map(c => ({
+        time: c.time, open: c.open, close: c.close, baseVol: c.baseVol,
+      })),
+    };
+
+    try {
+      const data = await postJson(ANTHROPIC_API_URL, {
+        model:      'claude-sonnet-4-6',
+        max_tokens: 500,
+        system:     RESEARCH_SYSTEM_PROMPT,
+        messages:   [{ role: 'user', content: JSON.stringify(payload) }],
+      }, {
+        'x-api-key':         process.env.ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+      });
+      res.json({ text: data.content[0].text, generatedAt: now() });
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
   });
 
   app.listen(PORT, () => {
@@ -771,6 +1474,11 @@ function startServer() {
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 async function main() {
+  if (!process.env.ANTHROPIC_API_KEY) {
+    console.log('⚠  ANTHROPIC_API_KEY not set — AI features (Spotters, Research) disabled');
+  } else {
+    console.log('✓  Anthropic API key detected — AI features enabled');
+  }
   startServer();
   while (true) {
     try {

@@ -1,0 +1,5 @@
+START.command
+.DS_Store
+node_modules/
+nohup.out
+*.log
