@@ -205,6 +205,87 @@ tr.dr.triple td:first-child { border-left: 2px solid var(--amber); }
   letter-spacing: .07em; cursor: pointer; outline: none;
 }
 .vol-sel option { background: var(--s1); color: var(--t1); }
+
+/* ── Drawer ── */
+#drawer-backdrop {
+  display: none; position: fixed; inset: 0; z-index: 90;
+  background: rgba(0,0,0,.45);
+}
+#drawer-backdrop.open { display: block; }
+
+#drawer {
+  position: fixed; top: 0; right: 0; bottom: 0; width: 480px; z-index: 91;
+  background: var(--s0); border-left: 1px solid var(--bd);
+  display: flex; flex-direction: column;
+  transform: translateX(100%); transition: transform .22s cubic-bezier(.4,0,.2,1);
+}
+#drawer.open { transform: translateX(0); }
+
+#drawer-hdr {
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px 16px; border-bottom: 1px solid var(--bd); flex-shrink: 0;
+}
+#drawer-title { display: flex; align-items: center; gap: 8px; flex: 1; min-width: 0; }
+#drawer-sym { font-size: 15px; font-weight: 700; font-family: var(--mono); color: var(--t1); }
+#drawer-score-badge { font-size: 11px; font-family: var(--mono); padding: 2px 7px; border-radius: 3px; }
+#drawer-stats { font-size: 11px; font-family: var(--mono); color: var(--t2); display: flex; gap: 12px; }
+#drawer-pin-btn {
+  padding: 3px 10px; border-radius: 3px; font-size: 11px; cursor: pointer;
+  border: 1px solid var(--bd); background: transparent; color: var(--t3);
+  transition: border-color .15s, color .15s; flex-shrink: 0;
+}
+#drawer-pin-btn.pinned { border-color: rgba(129,140,248,.4); color: var(--purple); background: rgba(129,140,248,.1); }
+#drawer-close {
+  background: none; border: none; color: var(--t3); font-size: 16px;
+  cursor: pointer; padding: 2px 4px; flex-shrink: 0;
+}
+#drawer-close:hover { color: var(--t1); }
+
+#drawer-chart {
+  flex-shrink: 0; padding: 10px 16px 6px; border-bottom: 1px solid var(--bd);
+  height: 90px; display: flex; align-items: center;
+}
+
+#drawer-chips {
+  flex-shrink: 0; display: flex; gap: 6px; flex-wrap: wrap;
+  padding: 8px 16px; border-bottom: 1px solid var(--bd);
+}
+.dchip {
+  padding: 4px 10px; border-radius: 3px; font-size: 11px; cursor: pointer;
+  border: 1px solid var(--bd); background: var(--s1); color: var(--t2);
+  transition: border-color .15s, color .15s; white-space: nowrap;
+}
+.dchip:hover { border-color: var(--blue); color: var(--t1); }
+
+#drawer-msgs {
+  flex: 1; overflow-y: auto; padding: 12px 16px; display: flex;
+  flex-direction: column; gap: 10px;
+  scrollbar-width: thin; scrollbar-color: var(--bd) transparent;
+}
+.dmsg { display: flex; flex-direction: column; gap: 2px; }
+.dmsg-who { font-size: 10px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; font-family: var(--mono); }
+.dmsg-who.prati { color: var(--purple); }
+.dmsg-who.you   { color: var(--blue); }
+.dmsg-body { font-size: 12px; line-height: 1.6; color: var(--t1); }
+.dmsg-body.dim  { color: var(--t3); font-style: italic; }
+.dmsg.dmsg-prati { padding-left: 10px; border-left: 2px solid rgba(129,140,248,.4); }
+
+#drawer-foot {
+  flex-shrink: 0; padding: 10px 12px; border-top: 1px solid var(--bd);
+  display: flex; gap: 8px; align-items: flex-end;
+}
+#drawer-in {
+  flex: 1; background: var(--bg); border: 1px solid var(--bd); border-radius: 3px;
+  padding: 7px 10px; color: var(--t1); font-family: inherit; font-size: 12px;
+  outline: none; resize: none; line-height: 1.4; min-height: 36px; max-height: 100px;
+}
+#drawer-in:focus { border-color: var(--purple); }
+#drawer-send {
+  width: 34px; height: 34px; background: var(--purple); border: none; border-radius: 3px;
+  color: #fff; font-size: 16px; cursor: pointer; display: flex; align-items: center; justify-content: center;
+}
+#drawer-send:hover:not(:disabled) { background: #6366f1; }
+#drawer-send:disabled { opacity: .35; cursor: default; }
 </style>
 </head>
 <body>
@@ -276,6 +357,26 @@ tr.dr.triple td:first-child { border-left: 2px solid var(--amber); }
   </div>
 </div>
 
+<div id="drawer-backdrop"></div>
+<div id="drawer">
+  <div id="drawer-hdr">
+    <div id="drawer-title">
+      <span id="drawer-sym"></span>
+      <span id="drawer-score-badge"></span>
+    </div>
+    <div id="drawer-stats"></div>
+    <button id="drawer-pin-btn"></button>
+    <button id="drawer-close">✕</button>
+  </div>
+  <div id="drawer-chart"></div>
+  <div id="drawer-chips"></div>
+  <div id="drawer-msgs"></div>
+  <div id="drawer-foot">
+    <textarea id="drawer-in" placeholder="Ask about this ticker…" rows="2"></textarea>
+    <button id="drawer-send">↑</button>
+  </div>
+</div>
+
 <script>
 'use strict';
 
@@ -286,6 +387,18 @@ var chatHist   = [];      // [{ role, content }]
 var chatBusy   = false;
 var volPeriod  = 5;
 var lastScanMs = null;
+
+var drawerSym     = null;          // currently open symbol
+var drawerHistory = {};            // symbol → [{ role, content }]
+var drawerBusy    = false;
+
+var DRAWER_CHIPS = [
+  { label: 'Real or wash?',       prompt: 'Is this volume real or wash trading?' },
+  { label: 'Fading or building?', prompt: 'Is momentum fading or still building?' },
+  { label: 'Entry now?',          prompt: 'Is this a good entry right now or should I wait?' },
+  { label: 'Red flags?',          prompt: 'Any red flags or reasons NOT to trade this?' },
+  { label: 'Quick summary',       prompt: 'Give me a 2-sentence summary of what is happening.' },
+];
 
 // ── SSE ──────────────────────────────────────────────────────────────────────
 var es = new EventSource('/api/stream');
@@ -391,7 +504,7 @@ function makeCard(sym, result) {
   el.dataset.sym  = sym;
   el.addEventListener('click', function (e) {
     if (e.target.classList.contains('pc-unpin')) return;
-    askAbout(sym);
+    openTicker(sym);
   });
   updateCard(el, sym, result);
   return el;
@@ -447,7 +560,7 @@ function renderTable(results) {
   });
 
   tbody.querySelectorAll('tr.dr').forEach(function (tr) {
-    tr.addEventListener('click', function () { askAbout(tr.dataset.sym); });
+    tr.addEventListener('click', function () { openTicker(tr.dataset.sym); });
   });
 }
 
@@ -691,6 +804,206 @@ function fmtPct(v) {
   var c = Math.min(9999, Math.max(-999, v));
   return (c >= 0 ? '+' : '') + c.toFixed(0) + '%';
 }
+
+// ── Drawer ────────────────────────────────────────────────────────────────────
+function openTicker(sym) {
+  drawerSym = sym;
+  var short = sym.replace(/USDT$/, '');
+  var r     = scan && scan.results && scan.results.find(function (x) { return x.symbol === sym; });
+
+  // Header
+  document.getElementById('drawer-sym').textContent = short;
+
+  // Score badge
+  var sb = document.getElementById('drawer-score-badge');
+  if (r) {
+    var score = r.score.toFixed(1);
+    sb.textContent = score;
+    sb.style.cssText = r.score > 25 ? 'background:rgba(129,140,248,.25);color:#a5b4fc;border:1px solid rgba(129,140,248,.5)'
+                     : r.score > 15 ? 'background:rgba(129,140,248,.12);color:#818cf8;border:1px solid rgba(129,140,248,.3)'
+                     : r.score >= 5  ? 'background:rgba(245,158,11,.1);color:#f59e0b;border:1px solid rgba(245,158,11,.3)'
+                     : 'background:transparent;color:var(--t3);border:1px solid var(--bd)';
+  } else {
+    sb.textContent = '—'; sb.style.cssText = '';
+  }
+
+  // Stats row
+  var stats = document.getElementById('drawer-stats');
+  if (r) {
+    var bpCol   = r.bp > 80 ? 'color:var(--green)' : r.bp < 30 ? 'color:var(--red)' : '';
+    var concCol = r.conc > 60 ? 'color:var(--red)' : r.conc > 40 ? 'color:var(--amber)' : '';
+    var ageStr  = r.age === 0 ? '<1m' : r.age + 'm';
+    stats.innerHTML =
+      '<span>age <b>' + ageStr + '</b></span>' +
+      '<span style="' + bpCol  + '">BP <b>' + r.bp + '%</b></span>' +
+      '<span style="' + concCol + '">Conc <b>' + r.conc.toFixed(0) + '%</b></span>' +
+      '<span>Abn <b>' + r.consecutiveAbnormal + '/5</b></span>';
+  } else {
+    stats.innerHTML = '<span style="color:var(--t3)">not in current scan</span>';
+  }
+
+  // Pin button
+  var pb = document.getElementById('drawer-pin-btn');
+  pb.textContent = pinned.has(sym) ? '📌 Pinned' : '+ Pin';
+  pb.className   = pinned.has(sym) ? 'pinned' : '';
+  pb.onclick     = function () {
+    if (pinned.has(sym)) unpinTicker(sym); else pinTicker(sym);
+    pb.textContent = pinned.has(sym) ? '+ Pin' : '📌 Pinned';
+    pb.className   = pinned.has(sym) ? '' : 'pinned';
+  };
+
+  // Extended chart
+  var chartEl = document.getElementById('drawer-chart');
+  fetch('/api/klines/' + sym)
+    .then(function (resp) { return resp.json(); })
+    .then(function (klines) {
+      if (!Array.isArray(klines) || !klines.length) { chartEl.innerHTML = '<span style="color:var(--t3);font-size:11px">No chart data</span>'; return; }
+      var baseline = r ? r.baselineAvg : null;
+      chartEl.innerHTML = extendedSvg(klines, baseline, chartEl.clientWidth - 32, 70);
+    })
+    .catch(function () { chartEl.innerHTML = ''; });
+
+  // Chips
+  var chipsEl = document.getElementById('drawer-chips');
+  chipsEl.innerHTML = DRAWER_CHIPS.map(function (c) {
+    return '<button class="dchip" data-prompt="' + c.prompt + '">' + c.label + '</button>';
+  }).join('');
+  chipsEl.querySelectorAll('.dchip').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      drawerSendChat(btn.dataset.prompt);
+    });
+  });
+
+  // Messages — restore history for this ticker
+  renderDrawerMsgs(sym);
+
+  // Open
+  document.getElementById('drawer').classList.add('open');
+  document.getElementById('drawer-backdrop').classList.add('open');
+  document.getElementById('drawer-in').focus();
+}
+
+function extendedSvg(klines, baselineAvg, totalW, h) {
+  var bars   = klines.slice(-120);
+  var maxVol = 0;
+  for (var k = 0; k < bars.length; k++) {
+    var v = parseFloat(bars[k].baseVol || bars[k].vol || 0);
+    if (v > maxVol) maxVol = v;
+  }
+  if (!maxVol) return '';
+  var bW = Math.max(2, Math.floor((totalW - bars.length) / bars.length));
+  var bG = 1;
+  var svgW = bars.length * (bW + bG) - bG;
+  var s = '<svg width="' + svgW + '" height="' + h + '" style="display:block">';
+  if (baselineAvg) {
+    var baseH = Math.min(h - 1, Math.max(1, (baselineAvg / maxVol) * h));
+    var baseY = (h - baseH).toFixed(1);
+    s += '<line x1="0" y1="' + baseY + '" x2="' + svgW + '" y2="' + baseY + '" stroke="#1e3a5f" stroke-dasharray="3,4" stroke-width="1"/>';
+  }
+  for (var j = 0; j < bars.length; j++) {
+    var c   = bars[j];
+    var vol = parseFloat(c.baseVol || c.vol || 0);
+    var x   = j * (bW + bG);
+    var bH  = Math.max(1, (vol / maxVol) * h);
+    var y   = (h - bH).toFixed(1);
+    var op  = j >= bars.length - 5 ? '1' : j >= bars.length - 15 ? '0.5' : '0.2';
+    var col = parseFloat(c.close) >= parseFloat(c.open) ? '#22c55e' : '#ef4444';
+    s += '<rect x="' + x + '" y="' + y + '" width="' + bW + '" height="' + bH.toFixed(1) + '" fill="' + col + '" opacity="' + op + '"/>';
+  }
+  s += '</svg>';
+  return s;
+}
+
+function closeDrawer() {
+  document.getElementById('drawer').classList.remove('open');
+  document.getElementById('drawer-backdrop').classList.remove('open');
+  drawerSym = null;
+}
+document.getElementById('drawer-close').addEventListener('click', closeDrawer);
+document.getElementById('drawer-backdrop').addEventListener('click', closeDrawer);
+document.addEventListener('keydown', function (e) { if (e.key === 'Escape') closeDrawer(); });
+
+function renderDrawerMsgs(sym) {
+  var msgs = document.getElementById('drawer-msgs');
+  msgs.innerHTML = '';
+  var hist = drawerHistory[sym] || [];
+  hist.forEach(function (m) {
+    addDrawerMsg(m.role === 'user' ? 'you' : 'prati', m.content, false, true);
+  });
+  if (!hist.length) {
+    var d = document.createElement('div');
+    d.className = 'dmsg dmsg-prati';
+    d.innerHTML = '<span class="dmsg-who prati">Prati</span><span class="dmsg-body dim">Ask me anything about ' + sym.replace(/USDT$/, '') + '.</span>';
+    msgs.appendChild(d);
+  }
+}
+
+function addDrawerMsg(who, text, loading, skipScroll) {
+  var msgs = document.getElementById('drawer-msgs');
+  var div  = document.createElement('div');
+  div.className = 'dmsg dmsg-' + who;
+  var w = document.createElement('span');
+  w.className = 'dmsg-who ' + who;
+  w.textContent = who === 'prati' ? 'Prati' : 'You';
+  var b = document.createElement('span');
+  b.className = 'dmsg-body' + (loading ? ' dim' : '');
+  b.textContent = text;
+  div.appendChild(w); div.appendChild(b);
+  msgs.appendChild(div);
+  if (!skipScroll) msgs.scrollTop = msgs.scrollHeight;
+  return b;
+}
+
+function drawerSendChat(text) {
+  text = text.trim();
+  if (!text || drawerBusy || !drawerSym) return;
+  drawerBusy = true;
+  document.getElementById('drawer-send').disabled = true;
+
+  var sym = drawerSym;
+  if (!drawerHistory[sym]) drawerHistory[sym] = [];
+
+  addDrawerMsg('you', text);
+  var replyEl = addDrawerMsg('prati', '…', true);
+  drawerHistory[sym].push({ role: 'user', content: text });
+
+  var hist = drawerHistory[sym].slice(-6);
+  if (hist.length && hist[0].role !== 'user') hist = hist.slice(1);
+
+  fetch('/api/ticker-chat', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ symbol: sym, message: text, history: hist.slice(0, -1) }),
+  })
+  .then(function (resp) { return resp.json(); })
+  .then(function (d) {
+    var reply = d.error ? ('Error: ' + d.error) : d.text;
+    replyEl.textContent = reply;
+    replyEl.classList.remove('dim');
+    if (!d.error) drawerHistory[sym].push({ role: 'assistant', content: reply });
+    document.getElementById('drawer-msgs').scrollTop = document.getElementById('drawer-msgs').scrollHeight;
+  })
+  .catch(function () { replyEl.textContent = 'Request failed.'; })
+  .finally(function () {
+    drawerBusy = false;
+    document.getElementById('drawer-send').disabled = false;
+  });
+}
+
+var drawerIn   = document.getElementById('drawer-in');
+var drawerSend = document.getElementById('drawer-send');
+drawerSend.addEventListener('click', function () {
+  var v = drawerIn.value; drawerIn.value = ''; drawerSendChat(v);
+});
+drawerIn.addEventListener('keydown', function (e) {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault(); var v = drawerIn.value; drawerIn.value = ''; drawerSendChat(v);
+  }
+});
+drawerIn.addEventListener('input', function () {
+  this.style.height = 'auto';
+  this.style.height = Math.min(100, this.scrollHeight) + 'px';
+});
 </script>
 </body>
 </html>

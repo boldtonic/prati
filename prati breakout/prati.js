@@ -22,6 +22,12 @@ const RECENT_CANDLES    = 5;
 const RATIO_THRESHOLD   = 3;
 const MIN_24H_VOL_USDT  = 500_000;
 const MAX_24H_VOL_USDT  = 100_000_000;
+// Large-caps excluded regardless of volume — breakouts on these don't signal the same thing
+const BLOCKLIST = new Set([
+  'BTCUSDT','ETHUSDT','BNBUSDT','SOLUSDT','XRPUSDT','ADAUSDT','DOTUSDT',
+  'AVAXUSDT','MATICUSDT','LINKUSDT','UNIUSDT','AAVEUSDT','LTCUSDT',
+  'ATOMUSDT','NEARUSDT','APTUSDT','ARBUSDT','OPUSDT','SUIUSDT','SEIUSDT',
+]);
 const SCAN_INTERVAL_MS  = 15_000;
 const API_DELAY_MS      = 50;
 const BATCH_SIZE        = 5;
@@ -90,6 +96,8 @@ function now() {
 
 // ─── AI prompts ───────────────────────────────────────────────────────────────
 
+const TICKER_CHAT_SYSTEM_PROMPT = `You are Prati, a focused trading intelligence monitoring a single Bitunix futures ticker. The user may be in a live trade or about to enter. Be extremely concise: 2-3 sentences max. First sentence is always a plain verdict (STRONG / WEAKENING / FADING / NOISE / HOLD). No disclaimers, no hedging, no "I cannot predict". Use the kline data and metrics directly.`;
+
 const CHAT_SYSTEM_PROMPT = `You are Prati, a live trading intelligence for a Bitunix futures scanner. You monitor 150+ mid/small-cap tickers for volume breakouts.
 
 Metric guide: score = avgRatio × consecutiveAbnormal (>15 strong, >25 exceptional). age = minutes since first detection (<5m fresh, >15m late). bp = buy pressure % (>80% bullish, <30% selling). conc = % of last hour's volume in last 5 minutes (baseline ~8%, >40% = concentrated now). vol5m/vol1h = % growth vs prior equivalent window. abn = candles above 3× baseline out of 5.
@@ -135,6 +143,8 @@ async function getEligibleTickers() {
   const data = await fetchJson(`${BASE_URL}/api/v1/futures/market/tickers`);
   if (data.code !== 0) throw new Error(`Tickers API: ${data.msg}`);
   return data.data.filter(t => {
+    if (!t.symbol.endsWith('USDT')) return false;   // USDT pairs only
+    if (BLOCKLIST.has(t.symbol))    return false;   // exclude large-caps
     const vol = parseFloat(t.quoteVol || 0);
     return vol >= MIN_24H_VOL_USDT && vol <= MAX_24H_VOL_USDT;
   });
@@ -1392,6 +1402,51 @@ function startServer() {
       const data = await postJson(ANTHROPIC_API_URL, {
         model: 'claude-sonnet-4-6', max_tokens: 400,
         system: CHAT_SYSTEM_PROMPT,
+        messages,
+      }, { 'x-api-key': process.env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' });
+      res.json({ text: data.content[0].text, at: now() });
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.post('/api/ticker-chat', async (req, res) => {
+    if (!process.env.ANTHROPIC_API_KEY) return res.status(503).json({ error: 'No API key' });
+    const { symbol, message, history } = req.body;
+    if (!symbol || !message) return res.status(400).json({ error: 'Missing symbol or message' });
+
+    const result  = latestResults.find(r => r.symbol === symbol);
+    const candles = klineCache.get(symbol);
+    const traj    = recentScans
+      .map(s => s.results && s.results.find(r => r.symbol === symbol))
+      .filter(Boolean)
+      .map(r => ({ score: +r.score.toFixed(1), bp: r.bp, conc: +r.conc.toFixed(0) }));
+
+    const context = {
+      symbol:   symbol.replace(/USDT$/, ''),
+      scanTime: latestMeta.scanTime,
+      ...(result && {
+        score: +result.score.toFixed(1), bp: result.bp,
+        conc:  +result.conc.toFixed(0),  vol5m: +result.vol5m.toFixed(0),
+        vol1h: +result.vol1h.toFixed(0), abn: result.consecutiveAbnormal,
+        age:   result.age,
+      }),
+      ...(candles && { klines: candles.slice(-60).map(c => ({ time: c.time, open: c.open, close: c.close, vol: c.baseVol })) }),
+      ...(traj.length && { trajectory: traj }),
+    };
+
+    let hist = (history || []).slice(-6);
+    if (hist.length && hist[0].role !== 'user') hist = hist.slice(1);
+
+    const messages = [
+      ...hist,
+      { role: 'user', content: `Context:\n${JSON.stringify(context)}\n\nQuestion: ${message}` },
+    ];
+
+    try {
+      const data = await postJson(ANTHROPIC_API_URL, {
+        model: 'claude-haiku-4-5-20251001', max_tokens: 250,
+        system: TICKER_CHAT_SYSTEM_PROMPT,
         messages,
       }, { 'x-api-key': process.env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' });
       res.json({ text: data.content[0].text, at: now() });
