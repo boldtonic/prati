@@ -255,6 +255,17 @@ let latestMeta        = { scanTime: null, duration: null, eligibleCount: 0 };
 let sseClients        = [];
 let isScanning        = false;
 let spottersActive    = false;
+
+// ── Security helpers ─────────────────────────────────────────────────────────
+const VALID_SYMBOL   = /^[A-Z0-9]{3,20}USDT$/;
+const aiRateLast     = new Map();  // ip → last request ms
+function checkAiRate(req, minMs = 1500) {
+  const ip   = req.ip || 'local';
+  const last = aiRateLast.get(ip) || 0;
+  if (Date.now() - last < minMs) return false;
+  aiRateLast.set(ip, Date.now());
+  return true;
+}
 let scanCycleCount    = 0;
 let lastAnalysis      = null;         // { text, generatedAt }
 let spotterCalling    = false;
@@ -1320,6 +1331,7 @@ function startServer() {
   });
 
   app.post('/api/pins/:symbol', (req, res) => {
+    if (!VALID_SYMBOL.test(req.params.symbol)) return res.status(400).json({ error: 'Invalid symbol' });
     pinnedTickers.add(req.params.symbol);
     pushSSE({ type: 'pins', pins: [...pinnedTickers] });
     log('PIN', `pinned ${req.params.symbol}`);
@@ -1327,6 +1339,7 @@ function startServer() {
   });
 
   app.delete('/api/pins/:symbol', (req, res) => {
+    if (!VALID_SYMBOL.test(req.params.symbol)) return res.status(400).json({ error: 'Invalid symbol' });
     pinnedTickers.delete(req.params.symbol);
     pinCommentary.delete(req.params.symbol);
     pinLastCommentary.delete(req.params.symbol);
@@ -1340,6 +1353,7 @@ function startServer() {
     if (!process.env.ANTHROPIC_API_KEY) {
       return res.status(503).json({ error: 'ANTHROPIC_API_KEY not set — add it to START.command' });
     }
+    if (!checkAiRate(req, 1500)) return res.status(429).json({ error: 'Too fast — wait a moment' });
     const { message, history } = req.body;
     if (!message) return res.status(400).json({ error: 'No message' });
 
@@ -1412,8 +1426,10 @@ function startServer() {
 
   app.post('/api/ticker-chat', async (req, res) => {
     if (!process.env.ANTHROPIC_API_KEY) return res.status(503).json({ error: 'No API key' });
+    if (!checkAiRate(req, 1000)) return res.status(429).json({ error: 'Too fast — wait a moment' });
     const { symbol, message, history } = req.body;
     if (!symbol || !message) return res.status(400).json({ error: 'Missing symbol or message' });
+    if (!VALID_SYMBOL.test(symbol)) return res.status(400).json({ error: 'Invalid symbol' });
 
     const result  = latestResults.find(r => r.symbol === symbol);
     const candles = klineCache.get(symbol);
@@ -1456,6 +1472,7 @@ function startServer() {
   });
 
   app.get('/api/klines/:symbol', (req, res) => {
+    if (!VALID_SYMBOL.test(req.params.symbol)) return res.status(400).json({ error: 'Invalid symbol' });
     const candles = klineCache.get(req.params.symbol);
     if (!candles) return res.status(404).json({ error: 'not in cache' });
     res.json(candles);
