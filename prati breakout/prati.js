@@ -1360,7 +1360,15 @@ function startServer() {
   const app = express();
   app.use(express.json());
 
+  const reactDist = path.join(__dirname, 'client/dist');
+  const hasReact  = fs.existsSync(path.join(reactDist, 'index.html'));
+
+  if (hasReact) {
+    app.use(express.static(reactDist));
+  }
+
   app.get('/', (_req, res) => {
+    if (hasReact) return res.sendFile(path.join(reactDist, 'index.html'));
     res.setHeader('Cache-Control', 'no-store');
     res.sendFile(path.join(__dirname, 'dashboard.html'));
   });
@@ -1605,6 +1613,11 @@ function startServer() {
       res.status(500).json({ error: e.message });
     }
   });
+
+  // React Router catch-all — must be after all API routes
+  if (hasReact) {
+    app.get('/{*path}', (_req, res) => res.sendFile(path.join(reactDist, 'index.html')));
+  }
 
   app.listen(PORT, () => {
     console.log(`Dashboard: http://localhost:${PORT}`);
