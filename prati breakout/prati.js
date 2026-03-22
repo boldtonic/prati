@@ -96,21 +96,51 @@ function now() {
 
 // ─── AI prompts ───────────────────────────────────────────────────────────────
 
-const TICKER_CHAT_SYSTEM_PROMPT = `You are Prati, a focused trading intelligence monitoring a single Bitunix futures ticker. The user may be in a live trade or about to enter. Be extremely concise: 2-3 sentences max. First sentence is always a plain verdict (STRONG / WEAKENING / FADING / NOISE / HOLD). No disclaimers, no hedging, no "I cannot predict". Use the kline data and metrics directly.`;
+const TICKER_CHAT_SYSTEM_PROMPT = `You are Prati, a sharp trading analyst embedded in a live Bitunix futures scanner. The user is an active trader who makes their own decisions — they want analysis, not disclaimers.
 
-const CHAT_SYSTEM_PROMPT = `You are Prati, a live trading intelligence for a Bitunix futures scanner. You monitor 150+ mid/small-cap tickers for volume breakouts.
+ALWAYS structure your response exactly like this (no headers, just flow):
 
-Metric guide: score = avgRatio × consecutiveAbnormal (>15 strong, >25 exceptional). age = minutes since first detection (<5m fresh, >15m late). bp = buy pressure % (>80% bullish, <30% selling). conc = % of last hour's volume in last 5 minutes (baseline ~8%, >40% = concentrated now). vol5m/vol1h = % growth vs prior equivalent window. abn = candles above 3× baseline out of 5.
+[VERDICT in caps]: one sentence explaining the key signal with specific numbers from the data.
+STOP: the specific candle level or pattern that invalidates this setup (e.g. "close below 0.2540 on volume").
+HORIZON: scalp (1-5m) / swing (5-30m) / avoid — pick one and say why.
+CONVICTION: X/5 — one sentence on what's holding you back or what makes this strong.
 
-Triple confirmation = score>15 AND conc>40 AND bp>80 simultaneously.
+Rules:
+- Never say "I cannot predict" or add risk disclaimers — the user knows the risks
+- Always reference actual numbers from the kline data provided
+- If the last candle was a spike followed by collapse, say FADE not STRONG
+- Distinguish: sustained volume ramp (accumulation) vs single spike (event/stop hunt)
+- Be wrong confidently rather than hedge endlessly — the user needs a decision framework, not a weather forecast`;
 
-When kline data is in the context, read the volume structure: escalating (staircase = sustained accumulation), spiking (single event, often shakeout), or distributed (sustained elevated = real move). Phase: ignition (1-2 abn candles, very early), acceleration (building, prime window), peak (massive single candle, often top), distribution (declining from peak, late).
+const CHAT_SYSTEM_PROMPT = `You are Prati, a live trading intelligence for a Bitunix futures scanner covering 135 mid/small-cap tickers.
 
-Pinned tickers are the user's active watches — treat them as high priority.
+METRIC GUIDE:
+- score = avgRatio × abnormal candle count (>15 strong, >25 exceptional)
+- age = minutes since first detection (<5m fresh, >15m late, >30m ignore)
+- bp = buy pressure % — what % of recent volume was buying (>80% bullish, <30% selling, 45-55% = manipulation/wash)
+- conc = % of last hour's volume in last 5 minutes (baseline ~8%, >40% = something happening NOW)
+- vol5m/vol1h = % growth vs prior equivalent window
+- abn = candles above 3× baseline out of last 5
 
-Be direct. Use actual numbers. 3-5 sentences unless asked for deep analysis. Lead with the answer.`;
+TRIPLE CONFIRMATION = score>15 AND conc>40 AND bp>80 simultaneously — this is the highest-conviction signal.
 
-const PIN_COMMENTARY_SYSTEM_PROMPT = `You are monitoring a pinned Bitunix futures ticker for a live trader. Given current metrics and trajectory, write exactly 1-2 sentences: what is happening RIGHT NOW and what to watch next. Use specific numbers. Examples: "Accelerating — score up 32→42→54 over 3 scans, BP 98%, still early." or "Fading — score dropped 54→23 last 2 scans, BP falling to 40%, likely peaked." No preamble, no hedging.`;
+When klines are available: classify the volume structure as:
+- ESCALATING: staircase of rising volume = sustained accumulation, best entries
+- SPIKING: single massive candle then drop = event/stop hunt, often fade
+- DISTRIBUTED: elevated across many candles = real move building
+
+ALWAYS complete the trade idea when asked about a specific ticker:
+1. What's happening (structure + phase)
+2. Entry timing (now / wait for confirmation / avoid)
+3. What invalidates the setup
+4. Rough time horizon
+
+Never hedge endlessly. Never add risk disclaimers. The user is an experienced trader who makes their own decisions.`;
+
+const PIN_COMMENTARY_SYSTEM_PROMPT = `You are monitoring a pinned Bitunix futures ticker for a live trader. Write exactly 2 sentences:
+1. Current status with specific numbers: is the breakout holding, fading, or building?
+2. What to watch for: the specific level or signal that changes the picture.
+No disclaimers. No hedging. Numbers only.`;
 
 const SPOTTER_SYSTEM_PROMPT = `You are a senior quant analyst embedded in Prati, a real-time volume breakout scanner for Bitunix crypto futures. You monitor mid/small-cap futures (500K–100M USDT daily volume) where sudden volume means accumulation or distribution.
 
@@ -266,6 +296,7 @@ function checkAiRate(req, minMs = 1500) {
   aiRateLast.set(ip, Date.now());
   return true;
 }
+const ignitionFired   = new Map(); // symbol → last candle time that fired ignition
 let scanCycleCount    = 0;
 let lastAnalysis      = null;         // { text, generatedAt }
 let spotterCalling    = false;
@@ -1286,6 +1317,43 @@ function getDashboardHTML() {
 </html>`;
 }
 
+// ─── Fast ignition check ──────────────────────────────────────────────────────
+
+function runIgnitionCheck() {
+  if (!latestResults.length) return;
+
+  for (const result of latestResults) {
+    const sym     = result.symbol;
+    const candles = klineCache.get(sym);
+    if (!candles || !candles.length) continue;
+
+    const last     = candles[candles.length - 1];
+    const baseline = result.baselineAvg;
+    if (!baseline || baseline <= 0) continue;
+
+    const ratio = last.baseVol / baseline;
+    if (ratio < 4) continue;
+
+    // Deduplicate — only fire once per candle timestamp
+    if (ignitionFired.get(sym) === last.time) continue;
+    ignitionFired.set(sym, last.time);
+
+    const short = sym.replace(/USDT$/, '');
+    log('IGN', `${short} candle spike ${ratio.toFixed(1)}× baseline`);
+    pushSSE({
+      type:     'ignition',
+      symbol:   sym,
+      ratio:    +ratio.toFixed(1),
+      vol:      last.baseVol,
+      baseline: +baseline.toFixed(0),
+      candle:   { open: last.open, close: last.close, time: last.time },
+      score:    result.score,
+      bp:       result.bp,
+      age:      result.age,
+    });
+  }
+}
+
 // ─── Web server ───────────────────────────────────────────────────────────────
 
 function startServer() {
@@ -1461,7 +1529,7 @@ function startServer() {
 
     try {
       const data = await postJson(ANTHROPIC_API_URL, {
-        model: 'claude-haiku-4-5-20251001', max_tokens: 250,
+        model: 'claude-sonnet-4-6', max_tokens: 400,
         system: TICKER_CHAT_SYSTEM_PROMPT,
         messages,
       }, { 'x-api-key': process.env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' });
@@ -1541,6 +1609,9 @@ function startServer() {
   app.listen(PORT, () => {
     console.log(`Dashboard: http://localhost:${PORT}`);
   });
+
+  // Fast ignition check — runs every 8s, pure in-memory
+  setInterval(runIgnitionCheck, 8_000);
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────

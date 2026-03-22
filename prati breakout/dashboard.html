@@ -206,6 +206,29 @@ tr.dr.triple td:first-child { border-left: 2px solid var(--amber); }
 }
 .vol-sel option { background: var(--s1); color: var(--t1); }
 
+/* ── Ignition bar ── */
+#ign-bar {
+  display: flex; align-items: center; gap: 6px; flex: 1;
+  padding: 0 20px; overflow: hidden;
+}
+.ign-pill {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 2px 9px; border-radius: 3px; font-size: 10px; font-family: var(--mono);
+  font-weight: 600; cursor: pointer; flex-shrink: 0;
+  background: rgba(245,158,11,.12); border: 1px solid rgba(245,158,11,.4);
+  color: var(--amber); animation: ign-fade 8s forwards;
+}
+@keyframes ign-fade {
+  0%   { opacity: 1; background: rgba(245,158,11,.25); border-color: rgba(245,158,11,.8); }
+  30%  { opacity: 1; background: rgba(245,158,11,.12); border-color: rgba(245,158,11,.4); }
+  100% { opacity: .35; }
+}
+@keyframes row-flash {
+  0%   { background: rgba(245,158,11,.25) !important; }
+  100% { background: transparent; }
+}
+tr.flash-ign td { animation: row-flash 1.5s ease-out forwards; }
+
 /* ── Drawer ── */
 #drawer-backdrop {
   display: none; position: fixed; inset: 0; z-index: 90;
@@ -295,6 +318,7 @@ tr.dr.triple td:first-child { border-left: 2px solid var(--amber); }
     <span class="brand">&#x092A;&#x094D;&#x0930;&#x0924;&#x093F; Prati<span class="brand-ver">v0.2</span></span>
     <div class="spill" id="spill"><span class="sdot"></span><span id="spill-lbl">Connecting…</span></div>
   </div>
+  <div id="ign-bar"></div>
   <div class="hdr-r">
     <span class="hmeta" id="h-info"></span>
     <span class="hmeta" id="h-age" style="color:var(--t3)"></span>
@@ -363,6 +387,7 @@ tr.dr.triple td:first-child { border-left: 2px solid var(--amber); }
     <div id="drawer-title">
       <span id="drawer-sym"></span>
       <span id="drawer-score-badge"></span>
+      <span style="font-size:9px;color:var(--t3);font-family:var(--mono);margin-left:2px">sonnet</span>
     </div>
     <div id="drawer-stats"></div>
     <button id="drawer-pin-btn"></button>
@@ -387,17 +412,19 @@ var chatHist   = [];      // [{ role, content }]
 var chatBusy   = false;
 var volPeriod  = 5;
 var lastScanMs = null;
+var ignitions    = {};   // symbol → { ratio, vol, at }
+var ignitionList = [];   // ordered list of recent ignitions, newest first
 
 var drawerSym     = null;          // currently open symbol
 var drawerHistory = {};            // symbol → [{ role, content }]
 var drawerBusy    = false;
 
 var DRAWER_CHIPS = [
-  { label: 'Real or wash?',       prompt: 'Is this volume real or wash trading?' },
-  { label: 'Fading or building?', prompt: 'Is momentum fading or still building?' },
-  { label: 'Entry now?',          prompt: 'Is this a good entry right now or should I wait?' },
-  { label: 'Red flags?',          prompt: 'Any red flags or reasons NOT to trade this?' },
-  { label: 'Quick summary',       prompt: 'Give me a 2-sentence summary of what is happening.' },
+  { label: '⚡ Quick verdict',      prompt: 'Give me your verdict on this right now.' },
+  { label: 'Real or stop hunt?',    prompt: 'Is this genuine accumulation or a stop hunt / wash trade?' },
+  { label: 'Fading or building?',   prompt: 'Is this momentum fading or still building? Look at the candle sequence.' },
+  { label: 'Entry & stop',          prompt: 'Where would you enter and where is the stop that invalidates this setup?' },
+  { label: 'Red flags',             prompt: 'What are the red flags or reasons NOT to take this trade?' },
 ];
 
 // ── SSE ──────────────────────────────────────────────────────────────────────
@@ -409,6 +436,7 @@ es.onmessage = function (e) {
   else if (d.type === 'scan')           onScan(d);
   else if (d.type === 'pins')           onPins(d.pins);
   else if (d.type === 'pin_commentary') onPinNote(d);
+  else if (d.type === 'ignition')       onIgnition(d);
 };
 
 function setStatus(s) {
@@ -416,6 +444,40 @@ function setStatus(s) {
   var label = document.getElementById('spill-lbl');
   pill.className = 'spill ' + (s === 'live' ? 'live' : s === 'scan' ? 'scan' : 'dead');
   label.textContent = s === 'live' ? 'Live' : s === 'scan' ? 'Scanning…' : 'Disconnected';
+}
+
+// ── Ignition ─────────────────────────────────────────────────────────────────
+function onIgnition(d) {
+  var sym   = d.symbol;
+  ignitions[sym] = { ratio: d.ratio, vol: d.vol, at: Date.now(), score: d.score, bp: d.bp };
+
+  // Add to list, keep last 5
+  ignitionList = ignitionList.filter(function(x) { return x.symbol !== sym; });
+  ignitionList.unshift(d);
+  if (ignitionList.length > 5) ignitionList.pop();
+
+  renderIgnitionBar();
+  flashTableRow(sym);
+}
+
+function renderIgnitionBar() {
+  var bar = document.getElementById('ign-bar');
+  if (!bar) return;
+  bar.innerHTML = ignitionList.map(function(d) {
+    var short = d.symbol.replace(/USDT$/, '');
+    return '<span class="ign-pill" onclick="openTicker(\'' + d.symbol + '\')">' +
+      '&#x26A1; ' + short + ' ' + d.ratio + '\u00d7' +
+    '</span>';
+  }).join('');
+}
+
+function flashTableRow(sym) {
+  var rows = document.querySelectorAll('tr.dr[data-sym="' + sym + '"]');
+  rows.forEach(function(tr) {
+    tr.classList.remove('flash-ign');
+    void tr.offsetWidth; // reflow to restart animation
+    tr.classList.add('flash-ign');
+  });
 }
 
 // ── Scan ─────────────────────────────────────────────────────────────────────
@@ -947,7 +1009,11 @@ function addDrawerMsg(who, text, loading, skipScroll) {
   w.textContent = who === 'prati' ? 'Prati' : 'You';
   var b = document.createElement('span');
   b.className = 'dmsg-body' + (loading ? ' dim' : '');
-  b.textContent = text;
+  if (who === 'prati' && !loading) {
+    b.innerHTML = renderMarkdown(text);
+  } else {
+    b.textContent = text;
+  }
   div.appendChild(w); div.appendChild(b);
   msgs.appendChild(div);
   if (!skipScroll) msgs.scrollTop = msgs.scrollHeight;
@@ -977,10 +1043,13 @@ function drawerSendChat(text) {
   })
   .then(function (resp) { return resp.json(); })
   .then(function (d) {
-    var reply = d.error ? ('Error: ' + d.error) : d.text;
-    replyEl.textContent = reply;
+    if (d.error) {
+      replyEl.textContent = 'Error: ' + d.error;
+    } else {
+      replyEl.innerHTML = renderMarkdown(d.text);
+      drawerHistory[sym].push({ role: 'assistant', content: d.text });
+    }
     replyEl.classList.remove('dim');
-    if (!d.error) drawerHistory[sym].push({ role: 'assistant', content: reply });
     document.getElementById('drawer-msgs').scrollTop = document.getElementById('drawer-msgs').scrollHeight;
   })
   .catch(function () { replyEl.textContent = 'Request failed.'; })
