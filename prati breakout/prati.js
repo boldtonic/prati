@@ -118,6 +118,9 @@ METRIC GUIDE:
 - score = avgRatio × abnormal candle count (>15 strong, >25 exceptional)
 - age = minutes since first detection (<5m fresh, >15m late, >30m ignore)
 - bp = buy pressure % — what % of recent volume was buying (>80% bullish, <30% selling, 45-55% = manipulation/wash)
+- emaCross = EMA9×EMA21 cross in last 5 candles: "bullish" (EMA9 just crossed above EMA21, momentum confirmed), "bearish" (EMA9 crossed below, momentum broken), null (no recent cross)
+- emaAlignment = current EMA9 vs EMA21 state: "bullish" (EMA9 > EMA21, trend up), "bearish" (EMA9 < EMA21, trend down)
+- A bullish emaCross on top of high volume + high bp = strong confirmation. A bearish emaCross during a volume spike = likely distribution, not accumulation.
 - conc = % of last hour's volume in last 5 minutes (baseline ~8%, >40% = something happening NOW)
 - vol5m/vol1h = % growth vs prior equivalent window
 - abn = candles above 3× baseline out of last 5
@@ -187,6 +190,44 @@ async function getKlines(symbol) {
   return data.data;
 }
 
+// ─── EMA ──────────────────────────────────────────────────────────────────────
+
+function calcEMASeries(values, period) {
+  if (values.length < period) return [];
+  const k      = 2 / (period + 1);
+  const result = new Array(values.length).fill(null);
+  let   ema    = values.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  result[period - 1] = ema;
+  for (let i = period; i < values.length; i++) {
+    ema       = values[i] * k + ema * (1 - k);
+    result[i] = ema;
+  }
+  return result;
+}
+
+function calcEMASignal(sorted) {
+  const closes     = sorted.map(c => parseFloat(c.close));
+  const ema9s      = calcEMASeries(closes, 9);
+  const ema21s     = calcEMASeries(closes, 21);
+  const last       = closes.length - 1;
+  const ema9       = ema9s[last];
+  const ema21      = ema21s[last];
+  if (!ema9 || !ema21) return null;
+
+  // Detect cross in last 5 candles
+  let emaCross = null;
+  for (let i = Math.max(21, last - 4); i < last; i++) {
+    const p9 = ema9s[i]; const p21 = ema21s[i];
+    const c9 = ema9s[i + 1]; const c21 = ema21s[i + 1];
+    if (!p9 || !p21 || !c9 || !c21) continue;
+    if (p9 < p21 && c9 >= c21) { emaCross = 'bullish'; break; }
+    if (p9 > p21 && c9 <= c21) { emaCross = 'bearish'; break; }
+  }
+
+  const emaAlignment = ema9 > ema21 ? 'bullish' : 'bearish';
+  return { ema9: +ema9.toFixed(6), ema21: +ema21.toFixed(6), emaCross, emaAlignment };
+}
+
 // ─── Detection ────────────────────────────────────────────────────────────────
 
 function calcBreakout(klines) {
@@ -225,7 +266,22 @@ function calcBreakout(klines) {
   const bp       = vol5mLast > 0 ? Math.round((greenVol / vol5mLast) * 100) : 50;
 
   const currentClose = parseFloat(sorted.at(-1).close);
-  return { score, avgRatio, consecutiveAbnormal, baselineAvg, recentAvg, currentClose, vol5m, vol1h, conc, bp };
+
+  // EMA9 × EMA21 signal
+  const ema         = calcEMASignal(sorted);
+  let   emaScore    = 0;
+  if (ema) {
+    if      (ema.emaCross === 'bullish') emaScore =  3;
+    else if (ema.emaCross === 'bearish') emaScore = -3;
+    else if (ema.emaAlignment === 'bullish') emaScore =  1;
+    else                                     emaScore = -1;
+  }
+
+  return {
+    score: score + emaScore, avgRatio, consecutiveAbnormal,
+    baselineAvg, recentAvg, currentClose, vol5m, vol1h, conc, bp,
+    ...(ema && { emaCross: ema.emaCross, emaAlignment: ema.emaAlignment, ema9: ema.ema9, ema21: ema.ema21 }),
+  };
 }
 
 // ─── Console display ──────────────────────────────────────────────────────────
@@ -287,13 +343,21 @@ let isScanning        = false;
 let spottersActive    = false;
 
 // ── Security helpers ─────────────────────────────────────────────────────────
-const VALID_SYMBOL   = /^[A-Z0-9]{3,20}USDT$/;
-const aiRateLast     = new Map();  // ip → last request ms
+const VALID_SYMBOL      = /^[A-Z0-9]{3,20}USDT$/;
+const aiRateLast        = new Map();  // ip → last chat request ms
+const tickerRateLast    = new Map();  // ip → last ticker-chat request ms
 function checkAiRate(req, minMs = 1500) {
   const ip   = req.ip || 'local';
   const last = aiRateLast.get(ip) || 0;
   if (Date.now() - last < minMs) return false;
   aiRateLast.set(ip, Date.now());
+  return true;
+}
+function checkTickerRate(req, minMs = 500) {
+  const ip   = req.ip || 'local';
+  const last = tickerRateLast.get(ip) || 0;
+  if (Date.now() - last < minMs) return false;
+  tickerRateLast.set(ip, Date.now());
   return true;
 }
 const ignitionFired   = new Map(); // symbol → last candle time that fired ignition
@@ -1360,15 +1424,7 @@ function startServer() {
   const app = express();
   app.use(express.json());
 
-  const reactDist = path.join(__dirname, 'client/dist');
-  const hasReact  = fs.existsSync(path.join(reactDist, 'index.html'));
-
-  if (hasReact) {
-    app.use(express.static(reactDist));
-  }
-
   app.get('/', (_req, res) => {
-    if (hasReact) return res.sendFile(path.join(reactDist, 'index.html'));
     res.setHeader('Cache-Control', 'no-store');
     res.sendFile(path.join(__dirname, 'dashboard.html'));
   });
@@ -1502,7 +1558,7 @@ function startServer() {
 
   app.post('/api/ticker-chat', async (req, res) => {
     if (!process.env.ANTHROPIC_API_KEY) return res.status(503).json({ error: 'No API key' });
-    if (!checkAiRate(req, 1000)) return res.status(429).json({ error: 'Too fast — wait a moment' });
+    if (!checkTickerRate(req, 500)) return res.status(429).json({ error: 'Too fast — wait a moment' });
     const { symbol, message, history } = req.body;
     if (!symbol || !message) return res.status(400).json({ error: 'Missing symbol or message' });
     if (!VALID_SYMBOL.test(symbol)) return res.status(400).json({ error: 'Invalid symbol' });
@@ -1522,6 +1578,8 @@ function startServer() {
         conc:  +result.conc.toFixed(0),  vol5m: +result.vol5m.toFixed(0),
         vol1h: +result.vol1h.toFixed(0), abn: result.consecutiveAbnormal,
         age:   result.age,
+        emaCross:     result.emaCross     || null,
+        emaAlignment: result.emaAlignment || null,
       }),
       ...(candles && { klines: candles.slice(-60).map(c => ({ time: c.time, open: c.open, close: c.close, vol: c.baseVol })) }),
       ...(traj.length && { trajectory: traj }),
@@ -1613,11 +1671,6 @@ function startServer() {
       res.status(500).json({ error: e.message });
     }
   });
-
-  // React Router catch-all — must be after all API routes
-  if (hasReact) {
-    app.get('/{*path}', (_req, res) => res.sendFile(path.join(reactDist, 'index.html')));
-  }
 
   app.listen(PORT, () => {
     console.log(`Dashboard: http://localhost:${PORT}`);
