@@ -1,6 +1,6 @@
 # Prati
 
-**Self-hosted BYOK AI trading assistant for Bitunix perpetual futures.**
+**Self-hosted BYOK AI trading team of agents for Bitunix perpetual futures.**
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-gold?style=flat-square)](LICENSE)
 [![Node.js](https://img.shields.io/badge/node-18%2B-green?style=flat-square&logo=node.js&logoColor=white)](https://nodejs.org/)
