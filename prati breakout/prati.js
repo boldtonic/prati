@@ -13,6 +13,7 @@
  */
 
 const express = require('express');
+const rateLimit = require('express-rate-limit');
 const path    = require('path');
 const fs      = require('fs');
 
@@ -1425,6 +1426,13 @@ function runIgnitionCheck() {
 function startServer() {
   const app = express();
   app.use(express.json());
+  app.use(rateLimit({
+    windowMs: 60 * 1000,
+    limit: 300,
+    standardHeaders: 'draft-8',
+    legacyHeaders: false,
+    message: { error: 'Too many requests' },
+  }));
 
   app.get('/', (_req, res) => {
     res.setHeader('Cache-Control', 'no-store');
