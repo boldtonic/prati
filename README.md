@@ -28,6 +28,7 @@ No hosted backend. No bundled API keys. No exchange API credentials. No order ex
 
 ## What you get
 
+- **Full AI agent team** - five specialized Claude Sonnet roles: Spotter, Research, Ticker Chat, Global Chat, and Pin Commentary
 - **AI trading desk** - direct chat with scanner-aware context, recent candles, top signals, pinned tickers, and trajectory
 - **Ticker analyst** - per-symbol chat that answers with verdict, stop/invalidation, horizon, and conviction
 - **Research agent** - one-click deep dive on volume structure, timing phase, direction, and bottom line
@@ -44,13 +45,13 @@ Prati uses a tiered agent stack. The scanner is the data layer; the agents are t
 
 Prati runs five specialized Claude Sonnet agent roles over the same live market signal engine. Each role receives different scan context, prompt instructions, and response budgets for its job.
 
-| Agent | Role | Example output |
-|---|---|---|
-| **Spotter** | Background board triage every few scans | "NEW", "ACCELERATING", "FADING", "PERSISTENT", "avoid" |
-| **Research** | Deep dive on one ticker | Volume structure, timing phase, direction, conviction, bottom line |
-| **Ticker chat** | Direct per-ticker analyst | Verdict, stop, horizon, conviction |
-| **Global chat** | Conversational scan intelligence | Strongest setup, sector movement, false positives, what changed |
-| **Pin commentary** | Ongoing monitor for pinned tickers | Current status plus what would change the picture |
+| Agent | Role | Context it sees | Response budget |
+|---|---|---|---|
+| **Spotter** | Background board triage every few scans | Current top signals, recent scan history, triple confirmations | 300 tokens |
+| **Research** | Deep dive on one ticker | Current metrics, trajectory, last 60 one-minute candles | 500 tokens |
+| **Ticker Chat** | Direct per-ticker analyst | One symbol's metrics, EMA state, klines, trajectory, chat history | 400 tokens |
+| **Global Chat** | Conversational scan intelligence | Top 15 signals, pinned tickers, mentioned ticker klines, chat history | 400 tokens |
+| **Pin Commentary** | Ongoing monitor for pinned tickers | Current ticker status, trajectory, recent candles | 120 tokens |
 
 The AI layer receives compact structured context: current metrics, recent scan trajectory, pinned tickers, mentioned ticker klines, and the latest 1-minute candles. It is designed to make the discussion concrete instead of generic.
 
