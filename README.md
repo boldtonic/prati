@@ -6,6 +6,7 @@
 [![Node.js](https://img.shields.io/badge/node-18%2B-green?style=flat-square&logo=node.js&logoColor=white)](https://nodejs.org/)
 [![Self-hosted](https://img.shields.io/badge/self--hosted-yes-8b5cf6?style=flat-square)]()
 [![BYOK](https://img.shields.io/badge/BYOK-bring%20your%20own%20keys-f59e0b?style=flat-square)]()
+[![AI agents](https://img.shields.io/badge/AI%20agents-trading%20desk-7c3aed?style=flat-square)]()
 [![X](https://img.shields.io/badge/X-@boldtonic-000000?style=flat-square&logo=x&logoColor=white)](https://x.com/boldtonic)
 [![LinkedIn](https://img.shields.io/badge/LinkedIn-Fernando%20Rullan-0A66C2?style=flat-square&logo=linkedin&logoColor=white)](https://www.linkedin.com/in/ferrullan/)
 
