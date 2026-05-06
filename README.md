@@ -1,4 +1,4 @@
-# Prati
+# प्रति Prati
 
 **Self-hosted BYOK AI trading team of agents for Bitunix perpetual futures.**
 
