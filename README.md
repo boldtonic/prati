@@ -42,6 +42,8 @@ No hosted backend. No bundled API keys. No exchange API credentials. No order ex
 
 Prati uses a tiered agent stack. The scanner is the data layer; the agents are the decision layer.
 
+Prati runs five specialized Claude Sonnet agent roles over the same live market signal engine. Each role receives different scan context, prompt instructions, and response budgets for its job.
+
 | Agent | Role | Example output |
 |---|---|---|
 | **Spotter** | Background board triage every few scans | "NEW", "ACCELERATING", "FADING", "PERSISTENT", "avoid" |
