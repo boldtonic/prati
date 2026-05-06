@@ -3,7 +3,7 @@
  * Prati — Bitunix Volume Breakout Scanner (Phase 2: Dashboard)
  *
  * Detection logic:
- *   BASELINE = avg USDT volume per 1-min candle over last 240 candles (skip 5 most recent)
+ *   BASELINE = avg USDT volume per 1-min candle over the lookback window (skip 5 most recent)
  *   RECENT   = last 5 candles
  *   SCORE    = avg_ratio × count(ratio > 3x) across recent candles
  *
@@ -110,9 +110,10 @@ Rules:
 - Always reference actual numbers from the kline data provided
 - If the last candle was a spike followed by collapse, say FADE not STRONG
 - Distinguish: sustained volume ramp (accumulation) vs single spike (event/stop hunt)
-- Be wrong confidently rather than hedge endlessly — the user needs a decision framework, not a weather forecast`;
+- Be wrong confidently rather than hedge endlessly — the user needs a decision framework, not a weather forecast
+- Always refer to tickers by their full symbol including the USDT suffix (e.g. SOLUSDT, not SOL)`;
 
-const CHAT_SYSTEM_PROMPT = `You are Prati, a live trading intelligence for a Bitunix futures scanner covering 135 mid/small-cap tickers.
+const CHAT_SYSTEM_PROMPT = `You are Prati, a live trading intelligence for a Bitunix futures scanner covering a filtered mid/small-cap USDT perpetual universe.
 
 METRIC GUIDE:
 - score = avgRatio × abnormal candle count (>15 strong, >25 exceptional)
@@ -138,12 +139,13 @@ ALWAYS complete the trade idea when asked about a specific ticker:
 3. What invalidates the setup
 4. Rough time horizon
 
-Never hedge endlessly. Never add risk disclaimers. The user is an experienced trader who makes their own decisions.`;
+Never hedge endlessly. Never add risk disclaimers. The user is an experienced trader who makes their own decisions.
+- Always refer to tickers by their full symbol including the USDT suffix (e.g. SOLUSDT, not SOL)`;
 
 const PIN_COMMENTARY_SYSTEM_PROMPT = `You are monitoring a pinned Bitunix futures ticker for a live trader. Write exactly 2 sentences:
 1. Current status with specific numbers: is the breakout holding, fading, or building?
 2. What to watch for: the specific level or signal that changes the picture.
-No disclaimers. No hedging. Numbers only.`;
+No disclaimers. No hedging. Numbers only. Always refer to tickers by their full symbol including the USDT suffix (e.g. SOLUSDT, not SOL).`;
 
 const SPOTTER_SYSTEM_PROMPT = `You are a senior quant analyst embedded in Prati, a real-time volume breakout scanner for Bitunix crypto futures. You monitor mid/small-cap futures (500K–100M USDT daily volume) where sudden volume means accumulation or distribution.
 
@@ -151,7 +153,7 @@ Data per ticker: Score (avgRatio × abnormalCount, >15 strong, >25 exceptional),
 
 Use previous scans to classify each ticker — NEW (not in prior scans = just started), ACCELERATING (score rising = strengthening), FADING (score falling = dying), PERSISTENT (all scans = check age).
 
-Output: 3–5 lines max. Lead with 1–2 actionable tickers or "Nothing actionable this cycle." For each: name, why it's interesting, early or late. Flag traps: high score + low bp = dumping; fading; stale age. Use ⚡ fresh, ⚠️ caution, ❌ avoid. No disclaimers, no hedging.`;
+Output: 3–5 lines max. Lead with 1–2 actionable tickers or "Nothing actionable this cycle." For each: name, why it's interesting, early or late. Flag traps: high score + low bp = dumping; fading; stale age. Use ⚡ fresh, ⚠️ caution, ❌ avoid. No disclaimers, no hedging. Always refer to tickers by their full symbol including the USDT suffix (e.g. SOLUSDT, not SOL).`;
 
 const RESEARCH_SYSTEM_PROMPT = `You are a quant researcher analyzing a specific Bitunix futures ticker from the Prati volume scanner.
 
@@ -529,7 +531,7 @@ async function updatePinCommentary(symbol, result, candles) {
     .map(r => ({ score: +r.score.toFixed(1), bp: r.bp, conc: +r.conc.toFixed(0) }));
 
   const payload = {
-    symbol: symbol.replace(/USDT$/, ''),
+    symbol: symbol,
     current: {
       score: +result.score.toFixed(1), age: result.age,
       bp: result.bp, conc: +result.conc.toFixed(0),
@@ -1491,7 +1493,7 @@ function startServer() {
 
     // Scan summary (top 15, compact)
     const signals = latestResults.slice(0, 15).map(r => ({
-      sym:   r.symbol.replace(/USDT$/, ''),
+      sym:   r.symbol,
       score: +r.score.toFixed(1),
       age:   r.age,
       bp:    r.bp,
@@ -1513,10 +1515,9 @@ function startServer() {
     const klines = {};
     const trajectory = {};
     for (const sym of mentioned) {
-      const short = sym.replace(/USDT$/, '');
       const cached = klineCache.get(sym);
       if (cached) {
-        klines[short] = cached.slice(-60).map(c => ({
+        klines[sym] = cached.slice(-60).map(c => ({
           time: c.time, open: c.open, close: c.close, vol: c.baseVol,
         }));
       }
@@ -1524,12 +1525,12 @@ function startServer() {
         .map(s => s.results.find(r => r.symbol === sym))
         .filter(Boolean)
         .map(r => ({ score: +r.score.toFixed(1), bp: r.bp, conc: +r.conc.toFixed(0) }));
-      if (traj.length) trajectory[short] = traj;
+      if (traj.length) trajectory[sym] = traj;
     }
 
     const context = {
       scanTime: latestMeta.scanTime,
-      pinned:   [...pinnedTickers].map(s => s.replace(/USDT$/, '')),
+      pinned:   [...pinnedTickers],
       signals,
       ...(Object.keys(klines).length      && { klines }),
       ...(Object.keys(trajectory).length  && { trajectory }),
@@ -1571,7 +1572,7 @@ function startServer() {
       .map(r => ({ score: +r.score.toFixed(1), bp: r.bp, conc: +r.conc.toFixed(0) }));
 
     const context = {
-      symbol:   symbol.replace(/USDT$/, ''),
+      symbol:   symbol,
       scanTime: latestMeta.scanTime,
       ...(result && {
         score: +result.score.toFixed(1), bp: result.bp,

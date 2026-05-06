@@ -12,7 +12,7 @@
 [![X](https://img.shields.io/badge/X-@boldtonic-000000?style=flat-square&logo=x&logoColor=white)](https://x.com/boldtonic)
 [![LinkedIn](https://img.shields.io/badge/LinkedIn-Fernando%20Rullan-0A66C2?style=flat-square&logo=linkedin&logoColor=white)](https://www.linkedin.com/in/ferrullan/)
 
-Prati is a local AI command center for perpetual traders. It watches +180 Bitunix mid/small-cap USDT perps in 10seconds, turns public market data into live breakout signals, and feeds that context into specialized Claude agents that help you decide what is building, what is fading, what deserves a deeper look, and what to avoid.
+Prati is a local AI command center for perpetual traders. It watches a filtered Bitunix mid/small-cap USDT perp universe every ~15 seconds, turns public market data into live breakout signals, and feeds that context into specialized Claude agents that help you decide what is building, what is fading, what deserves a deeper look, and what to avoid.
 
 Ask it things like:
 
@@ -45,6 +45,8 @@ Prati uses a tiered agent stack. The scanner is the data layer; the agents are t
 
 Prati runs five specialized Claude Sonnet agent roles over the same live market signal engine. Each role receives different scan context, prompt instructions, and response budgets for its job.
 
+Current runtime model in `prati.js`: `claude-sonnet-4-6` for all five roles.
+
 | Agent | Role | Context it sees | Response budget |
 |---|---|---|---|
 | **Spotter** | Background board triage every few scans | Current top signals, recent scan history, triple confirmations | 300 tokens |
@@ -72,7 +74,7 @@ Any red flags in the top 15?
 
 Prati scans Bitunix public futures data, read-only:
 
-- Around 135 mid/small-cap USDT perpetual tickers
+- Filtered mid/small-cap USDT perpetual universe; live count varies with Bitunix listings and volume filters
 - 200 one-minute candles per ticker
 - 24h volume filters to avoid mega-caps and dead markets
 - No database; scan state lives in memory

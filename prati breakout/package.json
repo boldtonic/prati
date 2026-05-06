@@ -1,4 +1,13 @@
 {
+  "name": "prati-breakout",
+  "private": true,
+  "version": "0.3.0",
+  "description": "Self-hosted BYOK AI trading agent team for Bitunix perpetual futures.",
+  "main": "prati.js",
+  "scripts": {
+    "start": "node prati.js"
+  },
+  "license": "MIT",
   "dependencies": {
     "express": "^5.2.1"
   }
