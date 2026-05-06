@@ -12,7 +12,7 @@
 [![X](https://img.shields.io/badge/X-@boldtonic-000000?style=flat-square&logo=x&logoColor=white)](https://x.com/boldtonic)
 [![LinkedIn](https://img.shields.io/badge/LinkedIn-Fernando%20Rullan-0A66C2?style=flat-square&logo=linkedin&logoColor=white)](https://www.linkedin.com/in/ferrullan/)
 
-Prati is a local AI command center for perpetual traders. It watches Bitunix mid/small-cap USDT perps, turns public market data into live breakout signals, and feeds that context into specialized Claude agents that help you decide what is building, what is fading, what deserves a deeper look, and what to avoid.
+Prati is a local AI command center for perpetual traders. It watches +180 Bitunix mid/small-cap USDT perps in 10seconds, turns public market data into live breakout signals, and feeds that context into specialized Claude agents that help you decide what is building, what is fading, what deserves a deeper look, and what to avoid.
 
 Ask it things like:
 
