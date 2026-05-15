@@ -17,10 +17,10 @@ Prati is a local AI command center for Web3 perpetual traders. It watches a filt
 
 Ask it things like:
 
-- "Should I long or short EIGENUSDT right now?"
+- "Is EIGENUSDT interesting right now?"
 - "Is this volume real or a stop hunt?"
 - "What is the strongest setup on the board?"
-- "Give me the entry, invalidation, horizon, and conviction."
+- "Give me a potential entry, invalidation, horizon, and conviction."
 - "Watch this pinned ticker and tell me if the picture changes."
 
 No hosted backend. No bundled API keys. No exchange API credentials. No order execution.
