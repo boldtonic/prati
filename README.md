@@ -156,7 +156,7 @@ Prati uses public market endpoints for scanner data. AI features read `ANTHROPIC
 
 ## Not financial advice
 
-Prati is decision-support software for traders, not financial advice. It can analyze setups, explain long/short arguments, identify invalidation points, and monitor pinned tickers, but you make the final trading decision.
+Prati is information-support software for traders, not financial advice. It can analyze setups, explain long/short arguments, identify invalidation points, and monitor pinned tickers, but you make the final trading decision.
 
 ---
 
